@@ -81,7 +81,7 @@ def animate_routes_to_gif(instance, schedule_by_day):
 
     ani = animation.FuncAnimation(fig, update, frames=range(1, instance.Days + 1), interval=500, repeat=False)
     
-    ani.save(save_path, writer='pillow')
+    ani.save(save_path, writer='pillow', fps = 1)
     print(f"Animation successfully saved to: {save_path}")
     
     plt.close()
