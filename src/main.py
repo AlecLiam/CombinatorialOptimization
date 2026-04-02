@@ -3,6 +3,7 @@ from InstanceCVRPTWUI import InstanceCVRPTWUI
 from baseline_solver import solve_baseline
 from output_formatter import write_solution
 from visualizer import plot_network, animate_routes_to_gif
+from validator_runner import run_validator
 def main():
     print("Starting Combinatorial Optimization algorithm")
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +39,7 @@ def main():
     schedule = solve_baseline(instance)
     animate_routes_to_gif(instance, schedule)
     write_solution(instance, schedule, solution_name = f"{instance.Name}")
-
+    run_validator(instance.Name)
+    
 if __name__ == "__main__":
     main()
