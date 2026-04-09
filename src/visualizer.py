@@ -3,13 +3,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-import pandas as pd
 
-def plot_network(instance, save_path=None):
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(current_dir, "..", "results", instance.Name)
+def plot_network(instance, output_dir):
     save_path = os.path.join(output_dir, f"{instance.Name}_network.png")
-
+    if os.path.exists(save_path): 
+        return
     depot_index = instance.DepotCoordinate
     depot = instance.Coordinates[depot_index]
     nodes_x = [coord.X for coord in instance.Coordinates if coord.ID != depot_index] 
@@ -28,14 +26,10 @@ def plot_network(instance, save_path=None):
     plt.grid(True, linestyle= '--', alpha=0.3)
     
     plt.savefig(save_path, format='png', dpi=300)
-    print(f"\nGraph {save_path} saved.")
+    plt.close()
 
-
-def animate_routes_to_gif(instance, schedule_by_day):    
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(current_dir, "..", "results", instance.Name)
-    save_path = os.path.join(output_dir, f"{instance.Name}_active_routes.gif")
-
+def animate_routes_to_gif(instance, schedule_by_day, save_path):    
+    print(f"Generating route animation: {os.path.basename(save_path)}")
     depot_idx = instance.DepotCoordinate
     depot = instance.Coordinates[depot_idx]
     nodes_x = [coord.X for coord in instance.Coordinates if coord.ID != depot_idx] 
@@ -50,7 +44,6 @@ def animate_routes_to_gif(instance, schedule_by_day):
 
     def update(day):
         ax.clear()
-        
         ax.scatter(nodes_x, nodes_y, c='lawngreen', label='Farms', s=50, zorder=3)
         ax.scatter(depot.X, depot.Y, c='magenta', label='Depot', s=60, zorder=3)
         
@@ -63,10 +56,8 @@ def animate_routes_to_gif(instance, schedule_by_day):
                 for i in range(len(route) - 1):
                     start_id = abs(route[i])
                     end_id = abs(route[i+1])
-                    
                     start_coord = instance.Coordinates[start_id]
                     end_coord = instance.Coordinates[end_id]
-                    
                     ax.plot([start_coord.X, end_coord.X], [start_coord.Y, end_coord.Y], 
                             c='blue', alpha=0.8, linewidth=2.5, zorder=1)
 
@@ -75,13 +66,9 @@ def animate_routes_to_gif(instance, schedule_by_day):
         ax.set_ylabel("Y coordinate")
         ax.grid(True, linestyle='--', alpha=0.3)
         ax.legend(loc="upper right")
-        
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
 
     ani = animation.FuncAnimation(fig, update, frames=range(1, instance.Days + 1), interval=500, repeat=False)
-    
-    ani.save(save_path, writer='pillow', fps = 1)
-    print(f"Animation successfully saved to: {save_path}")
-    
+    ani.save(save_path, writer='pillow', fps=1)
     plt.close()

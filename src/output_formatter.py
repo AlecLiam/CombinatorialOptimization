@@ -1,12 +1,7 @@
 import os
 
-def write_solution(instance, schedule_by_day, solution_name = "solution"):
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(current_dir, "..", "results", instance.Name)   
-    file_path = os.path.join(output_dir, f"{solution_name}.txt")
-
+def write_solution(instance, schedule_by_day, file_path, solution_name="solution"):
     num_tools = len(instance.Tools)
-
     simulated_inventory = [0] * num_tools
     min_inventory = [0] * num_tools
     
@@ -15,11 +10,9 @@ def write_solution(instance, schedule_by_day, solution_name = "solution"):
         for trip in trips:
             for i in range(num_tools):
                 simulated_inventory[i] += trip["tools_loaded"][i] 
-        
         for i in range(num_tools):
             if simulated_inventory[i] < min_inventory[i]:
                 min_inventory[i] = simulated_inventory[i]
-                
         for trip in trips:
             for i in range(num_tools):
                 simulated_inventory[i] += trip["tools_returned"][i] 
@@ -42,7 +35,6 @@ def write_solution(instance, schedule_by_day, solution_name = "solution"):
     with open(file_path, 'w') as f:
         f.write(f"DATASET = {instance.Dataset}\n")
         f.write(f"NAME = {solution_name}\n\n")
-        
         f.write(f"MAX_NUMBER_OF_VEHICLES = {max_vehicles}\n")
         f.write(f"NUMBER_OF_VEHICLE_DAYS = {vehicle_days}\n")
         f.write(f"TOOL_USE = {' '.join(str(x) for x in tool_use)}\n")
@@ -51,22 +43,19 @@ def write_solution(instance, schedule_by_day, solution_name = "solution"):
         
         for day in sorted(schedule_by_day.keys()):
             trips = schedule_by_day[day]
-            if not trips:
-                continue
+            if not trips: continue
                 
             f.write(f"DAY = {day}\n")
             f.write(f"NUMBER_OF_VEHICLES = {len(trips)}\n")
             
             start_depot = list(current_inventory)
             for trip in trips:
-                for i in range(num_tools):
-                    start_depot[i] += trip["tools_loaded"][i] 
+                for i in range(num_tools): start_depot[i] += trip["tools_loaded"][i] 
             f.write(f"START_DEPOT = {' '.join(str(x) for x in start_depot)}\n")
             
             finish_depot = list(start_depot)
             for trip in trips:
-                for i in range(num_tools):
-                    finish_depot[i] += trip["tools_returned"][i] 
+                for i in range(num_tools): finish_depot[i] += trip["tools_returned"][i] 
             f.write(f"FINISH_DEPOT = {' '.join(str(x) for x in finish_depot)}\n")
             
             for vehicle_idx, trip in enumerate(trips, start=1):
@@ -78,11 +67,9 @@ def write_solution(instance, schedule_by_day, solution_name = "solution"):
                 
                 returned_str = "\t".join(str(x) for x in trip["tools_returned"])
                 f.write(f"{vehicle_idx}\tV\t2\t{returned_str}\n")
-                
                 f.write(f"{vehicle_idx}\tD\t{trip['distance']}\n")
                 
             f.write("\n")
             current_inventory = finish_depot
 
-    print(f"Final solution saved to: {file_path}")
-    return file_path
+    return total_cost
