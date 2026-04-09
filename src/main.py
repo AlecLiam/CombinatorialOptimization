@@ -72,7 +72,7 @@ def process_instance(file_path):
             best_global_cost = get_existing_cost(global_opt_path)
             
             if new_cost < best_global_cost or not os.path.exists(global_opt_path):
-                print(f"   NEW GLOBAL OPTIMAL CROWNED! Cost: {new_cost:,.0f}")
+                print(f"   NEW GLOBAL OPTIMAL FOUND! Cost: {new_cost:,.0f}")
                 if os.path.exists(final_sol_path): shutil.copy(final_sol_path, global_opt_path)
                 if os.path.exists(all_routes_path): shutil.copy(all_routes_path, os.path.join(optimal_dir, f"{instance.Name}_optimal_all_routes.png"))
                 if os.path.exists(gif_path): shutil.copy(gif_path, os.path.join(optimal_dir, f"{instance.Name}_optimal_active_routes.gif"))
