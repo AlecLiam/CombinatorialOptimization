@@ -7,7 +7,7 @@ import pandas as pd
 
 def plot_network(instance, save_path=None):
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(current_dir, "..", "output")
+    output_dir = os.path.join(current_dir, "..", "results", instance.Name)
     save_path = os.path.join(output_dir, f"{instance.Name}_network.png")
 
     depot_index = instance.DepotCoordinate
@@ -16,8 +16,8 @@ def plot_network(instance, save_path=None):
     nodes_y = [coord.Y for coord in instance.Coordinates if coord.ID != depot_index] 
 
     plt.figure(figsize=(8, 6))
-    plt.scatter(nodes_x, nodes_y, c='lawngreen', label= 'Farms', s=50 , zorder = 3)
-    plt.scatter(depot.X, depot.Y, c='magenta', label= 'Depot', s = 60, zorder= 2)
+    plt.scatter(nodes_x, nodes_y, c='lawngreen', label= 'Farms', s=50 , zorder = 2)
+    plt.scatter(depot.X, depot.Y, c='magenta', label= 'Depot', s = 100, zorder= 3)
     for coord in instance.Coordinates:
         plt.annotate(str(coord.ID), (coord.X, coord.Y), textcoords="offset points", xytext= (0, 8), ha= 'center', fontsize='14')
     plt.title(f"Node network for {instance.Name}", fontsize= 15)
@@ -33,7 +33,7 @@ def plot_network(instance, save_path=None):
 
 def animate_routes_to_gif(instance, schedule_by_day):    
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(current_dir, "..", "output")
+    output_dir = os.path.join(current_dir, "..", "results", instance.Name)
     save_path = os.path.join(output_dir, f"{instance.Name}_active_routes.gif")
 
     depot_idx = instance.DepotCoordinate

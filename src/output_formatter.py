@@ -2,7 +2,7 @@ import os
 
 def write_solution(instance, schedule_by_day, solution_name = "solution"):
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(current_dir, "..", "solutions")
+    output_dir = os.path.join(current_dir, "..", "results", instance.Name)   
     file_path = os.path.join(output_dir, f"{solution_name}.txt")
 
     num_tools = len(instance.Tools)

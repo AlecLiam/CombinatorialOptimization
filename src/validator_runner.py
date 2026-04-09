@@ -12,7 +12,7 @@ def run_validator(instance_name):
     project_root = os.path.abspath(os.path.join(src_dir, ".."))
     validator_path = os.path.join(project_root, "validator", "Validate.py")
     instance_path = os.path.join(project_root, "data", f"{instance_name}.txt")
-    solution_path = os.path.join(project_root, "solutions", f"{instance_name}.txt")
+    solution_path = os.path.join(project_root, "results", instance_name, f"{instance_name}.txt")
     command = [sys.executable, validator_path, "-i", instance_path, "-s", solution_path]
     
     try:
