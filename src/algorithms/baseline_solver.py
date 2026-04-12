@@ -1,41 +1,11 @@
 import random
+from utils import build_heuristic_trips
 
 def solve_baseline(instance):
     depot = instance.DepotCoordinate
     num_tools = len(instance.Tools)
     if instance.calcDistance is None:
         instance.calculateDistances()
-
-    def build_schedule(start_days):
-        schedule_by_day = {day: [] for day in range(1, instance.Days + 2)}
-        for req in instance.Requests:
-            start_day = start_days[req.ID]
-            dist = instance.calcDistance[depot][req.node] + instance.calcDistance[req.node][depot]
-            tool_idx = req.tool - 1
-            tools_loaded_del = [0] * num_tools
-            tools_loaded_del[tool_idx] = -req.toolCount
-            tools_returned_del = [0] * num_tools
-            
-            schedule_by_day[start_day].append({
-                "route": [depot, req.ID, depot],
-                "tools_loaded": tools_loaded_del,
-                "tools_returned": tools_returned_del,
-                "distance": dist
-            })
-
-            pickup_day = start_day + req.numDays
-            if pickup_day <= instance.Days:
-                tools_loaded_pick = [0] * num_tools
-                tools_returned_pick = [0] * num_tools
-                tools_returned_pick[tool_idx] = req.toolCount
-                
-                schedule_by_day[pickup_day].append({
-                    "route": [depot, -req.ID, depot],
-                    "tools_loaded": tools_loaded_pick,
-                    "tools_returned": tools_returned_pick,
-                    "distance": dist
-                })
-        return {day: trips for day, trips in schedule_by_day.items() if day <= instance.Days}
 
     def attempt_greedy(sorted_reqs):
         start_days = {}
@@ -82,7 +52,8 @@ def solve_baseline(instance):
         sorted_requests = sorted(instance.Requests, key=sort_key)
         result = attempt_greedy(sorted_requests)
         if result is not None:
-            return build_schedule(result)
+            # ---> NOW USES UTILS ROUTER <---
+            return build_heuristic_trips(instance, result)
 
     def attempt_min_conflicts():
         start_days = {req.ID: random.randint(req.fromDay, req.toDay) for req in instance.Requests}
@@ -147,6 +118,6 @@ def solve_baseline(instance):
     for restart in range(50):
         res = attempt_min_conflicts()
         if res is not None:
-            return build_schedule(res)
+            return build_heuristic_trips(instance, res)
 
     return {day: [] for day in range(1, instance.Days + 2)}

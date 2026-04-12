@@ -2,13 +2,15 @@ import os
 import glob
 import shutil
 from InstanceCVRPTWUI import InstanceCVRPTWUI
-from baseline_solver import solve_baseline
+from algorithms.baseline_solver import solve_baseline
+from algorithms.simulated_annealing_solver import solve_sa
 from output_formatter import write_solution
 from visualizer import plot_network, animate_routes_to_gif
 from validator_runner import run_validator
 
 ALGORITHMS = {
-    "Baseline": solve_baseline
+    "Baseline": solve_baseline,
+    "Simulated Annealing": solve_sa
 }
 
 def get_existing_cost(file_path):
