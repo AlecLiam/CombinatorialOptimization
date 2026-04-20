@@ -1,11 +1,56 @@
 import random
-from utils import build_heuristic_trips
 
-def solve_baseline(instance):
-    depot = instance.DepotCoordinate
-    num_tools = len(instance.Tools)
+def calculate_all_distances(instance):
     if instance.calcDistance is None:
         instance.calculateDistances()
+
+def route_day_naive(instance, tasks):
+    if not tasks: return []
+    
+    depot = instance.DepotCoordinate
+    num_tools = len(instance.Tools)
+    trips = []
+    
+    for task in tasks:
+        req = task["req"]
+        node_id = req.ID if task["type"] == "delivery" else -req.ID
+        dist = instance.calcDistance[depot][req.node] + instance.calcDistance[req.node][depot]
+        
+        tools_loaded = [0] * num_tools
+        tools_returned = [0] * num_tools
+        
+        if task["type"] == "delivery":
+            tools_loaded[req.tool - 1] = -req.toolCount
+        else:
+            tools_returned[req.tool - 1] = req.toolCount
+            
+        trips.append({
+            "route": [depot, node_id, depot],
+            "tools_loaded": tools_loaded,
+            "tools_returned": tools_returned,
+            "distance": dist
+        })
+        
+    return trips
+
+def build_baseline_trips(instance, start_days):
+    calculate_all_distances(instance)
+    schedule_by_day = {day: [] for day in range(1, instance.Days + 2)}
+    for day in range(1, instance.Days + 2):
+        tasks = []
+        for req in instance.Requests:
+            sd = start_days[req.ID]
+            if sd == day:
+                tasks.append({"req": req, "type": "delivery"})
+            pd = sd + req.numDays
+            if pd == day and pd <= instance.Days:
+                tasks.append({"req": req, "type": "pickup"})
+        schedule_by_day[day] = route_day_naive(instance, tasks)
+    return schedule_by_day
+
+def solve_baseline(instance):
+    calculate_all_distances(instance)
+    num_tools = len(instance.Tools)
 
     def attempt_greedy(sorted_reqs):
         start_days = {}
@@ -15,7 +60,6 @@ def solve_baseline(instance):
             tool_idx = req.tool - 1
             max_cap = instance.Tools[tool_idx].amount
             best_start_day = None
-            best_peak = float('inf')
 
             for start_day in range(req.fromDay, req.toDay + 1):
                 peak = 0
@@ -25,9 +69,8 @@ def solve_baseline(instance):
                             peak = daily_tool_usage[d][tool_idx]
                 
                 if peak + req.toolCount <= max_cap:
-                    if peak < best_peak:
-                        best_peak = peak
-                        best_start_day = start_day
+                    best_start_day = start_day
+                    break 
 
             if best_start_day is None:
                 return None
@@ -52,8 +95,7 @@ def solve_baseline(instance):
         sorted_requests = sorted(instance.Requests, key=sort_key)
         result = attempt_greedy(sorted_requests)
         if result is not None:
-            # ---> NOW USES UTILS ROUTER <---
-            return build_heuristic_trips(instance, result)
+            return build_baseline_trips(instance, result)
 
     def attempt_min_conflicts():
         start_days = {req.ID: random.randint(req.fromDay, req.toDay) for req in instance.Requests}
@@ -118,6 +160,6 @@ def solve_baseline(instance):
     for restart in range(50):
         res = attempt_min_conflicts()
         if res is not None:
-            return build_heuristic_trips(instance, res)
+            return build_baseline_trips(instance, res)
 
     return {day: [] for day in range(1, instance.Days + 2)}
