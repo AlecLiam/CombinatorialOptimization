@@ -4,6 +4,7 @@ import shutil
 from InstanceCVRPTWUI import InstanceCVRPTWUI
 from algorithms.baseline_solver import solve_baseline
 from algorithms.simulated_annealing_solver import solve_sa
+from algorithms.SA_hybrid import solve_SA_hybrid
 from output_formatter import write_solution
 from visualizer import plot_network, animate_routes_to_gif
 from validator_runner import run_validator
@@ -11,6 +12,7 @@ from validator_runner import run_validator
 ALGORITHMS = {
     "Baseline": solve_baseline,
     "Simulated Annealing": solve_sa
+    "Two-Phase": solve_SA_hybrid
 }
 
 def get_existing_cost(file_path):
