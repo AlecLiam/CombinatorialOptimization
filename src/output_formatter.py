@@ -62,11 +62,12 @@ def write_solution(instance, schedule_by_day, file_path, solution_name="solution
                 route_str = "\t".join(str(node) for node in trip["route"])
                 f.write(f"{vehicle_idx}\tR\t{route_str}\n")
                 
-                loaded_str = "\t".join(str(x) for x in trip["tools_loaded"])
-                f.write(f"{vehicle_idx}\tV\t1\t{loaded_str}\n")
-                
-                returned_str = "\t".join(str(x) for x in trip["tools_returned"])
-                f.write(f"{vehicle_idx}\tV\t2\t{returned_str}\n")
+                visit_loads = trip.get("visit_loads")
+                if visit_loads is None:
+                    visit_loads = [trip["tools_loaded"], trip["tools_returned"]]
+                for visit_idx, visit in enumerate(visit_loads, start=1):
+                    visit_str = "\t".join(str(x) for x in visit)
+                    f.write(f"{vehicle_idx}\tV\t{visit_idx}\t{visit_str}\n")
                 f.write(f"{vehicle_idx}\tD\t{trip['distance']}\n")
                 
             f.write("\n")

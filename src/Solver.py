@@ -31,7 +31,7 @@ def get_existing_cost(file_path):
     except: pass
     return float('inf')
 
-def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True):
+def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=1, sa_seed=None, route_merge=True, routing_method="greedy"):
     instance = InstanceCVRPTWUI(file_path)
     
     instance.Name = os.path.splitext(os.path.basename(file_path))[0]
@@ -73,7 +73,16 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
         
         best_algo_cost = get_existing_cost(final_sol_path)
         
-        schedule = solver_func(instance)
+        if algo_name == "Simulated Annealing":
+            schedule = solver_func(
+                instance,
+                runs=sa_runs,
+                seed=sa_seed,
+                route_merge=route_merge,
+                routing_method=routing_method,
+            )
+        else:
+            schedule = solver_func(instance)
         new_cost = write_solution(instance, schedule, file_path=temp_sol_path, solution_name=f"{instance.Name}_{algo_name}")
         is_valid = run_validator(instance.Name, temp_sol_path)
         
@@ -137,6 +146,29 @@ def main():
         action="store_true",
         help="Skip network plots and GIFs for faster benchmark runs.",
     )
+    parser.add_argument(
+        "--sa-runs",
+        type=int,
+        default=1,
+        help="Number of simulated annealing starts to run before keeping the best schedule.",
+    )
+    parser.add_argument(
+        "--sa-seed",
+        type=int,
+        default=None,
+        help="Optional base random seed for reproducible simulated annealing multi-start runs.",
+    )
+    parser.add_argument(
+        "--no-route-merge",
+        action="store_true",
+        help="Disable simulated annealing route merge post-processing.",
+    )
+    parser.add_argument(
+        "--routing-method",
+        choices=("greedy", "insertion"),
+        default="greedy",
+        help="Daily route construction method for simulated annealing.",
+    )
     args = parser.parse_args()
 
     print("Starting Combinatorial Optimization Pipeline")
@@ -176,6 +208,10 @@ def main():
             reference_results_root=reference_results_root,
             update_best=update_best,
             make_visuals=not args.no_visuals,
+            sa_runs=args.sa_runs,
+            sa_seed=args.sa_seed,
+            route_merge=not args.no_route_merge,
+            routing_method=args.routing_method,
         )
         all_rows.extend(rows)
 
