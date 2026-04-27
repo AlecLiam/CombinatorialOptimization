@@ -31,7 +31,7 @@ def get_existing_cost(file_path):
     except: pass
     return float('inf')
 
-def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=1, sa_seed=None, route_merge=True, routing_method="greedy"):
+def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=1, sa_seed=None, route_merge=True, routing_method="greedy", alns_iterations=0, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
     instance = InstanceCVRPTWUI(file_path)
     
     instance.Name = os.path.splitext(os.path.basename(file_path))[0]
@@ -80,6 +80,10 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
                 seed=sa_seed,
                 route_merge=route_merge,
                 routing_method=routing_method,
+                alns_iterations=alns_iterations,
+                alns_destroy_fraction=alns_destroy_fraction,
+                alns_strategy=alns_strategy,
+                alns_repair=alns_repair,
             )
         else:
             schedule = solver_func(instance)
@@ -169,6 +173,30 @@ def main():
         default="greedy",
         help="Daily route construction method for simulated annealing.",
     )
+    parser.add_argument(
+        "--alns-iterations",
+        type=int,
+        default=0,
+        help="Run this many ALNS destroy/repair iterations after each simulated annealing run.",
+    )
+    parser.add_argument(
+        "--alns-destroy-fraction",
+        type=float,
+        default=0.06,
+        help="Fraction of requests removed and repaired in each ALNS iteration.",
+    )
+    parser.add_argument(
+        "--alns-strategy",
+        choices=("auto", "distance", "tools", "vehicle_days", "fixed_vehicle"),
+        default="auto",
+        help="ALNS strategy. Auto chooses the current dominant objective part.",
+    )
+    parser.add_argument(
+        "--alns-repair",
+        choices=("auto", "greedy", "regret"),
+        default="auto",
+        help="ALNS repair method. Auto uses greedy for distance and regret otherwise.",
+    )
     args = parser.parse_args()
 
     print("Starting Combinatorial Optimization Pipeline")
@@ -212,6 +240,10 @@ def main():
             sa_seed=args.sa_seed,
             route_merge=not args.no_route_merge,
             routing_method=args.routing_method,
+            alns_iterations=args.alns_iterations,
+            alns_destroy_fraction=args.alns_destroy_fraction,
+            alns_strategy=args.alns_strategy,
+            alns_repair=args.alns_repair,
         )
         all_rows.extend(rows)
 
