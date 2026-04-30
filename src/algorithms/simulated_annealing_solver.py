@@ -3,12 +3,14 @@ import math
 from algorithms.baseline_solver import solve_baseline
 
 ROUTING_METHOD = "greedy"
+ROUTE_DAY_CACHE = {}
 
 def set_routing_method(method):
-    global ROUTING_METHOD
-    if method not in ("greedy", "insertion"):
+    global ROUTING_METHOD, ROUTE_DAY_CACHE
+    if method not in ("greedy", "insertion", "regret", "greedy_repair", "insertion_repair", "regret_repair"):
         raise ValueError(f"Unknown routing method: {method}")
     ROUTING_METHOD = method
+    ROUTE_DAY_CACHE = {}
 
 def calculate_all_distances(instance):
     if instance.calcDistance is None:
@@ -20,12 +22,16 @@ def is_schedule_feasible(instance, start_days):
     
     for req in instance.Requests:
         sd = start_days[req.ID]
-        for d in range(sd, sd + req.numDays + 1):
+        for d in active_tool_days(instance, req, sd):
             if d <= instance.Days:
                 daily_usage[d][req.tool - 1] += req.toolCount
                 if daily_usage[d][req.tool - 1] > instance.Tools[req.tool - 1].amount:
                     return False
     return True
+
+def active_tool_days(instance, req, start_day):
+    last_active_day = min(start_day + req.numDays, instance.Days)
+    return range(start_day, last_active_day + 1)
 
 def get_tool_size(tool):
     for attr in ['size', 'Size', 'weight', 'Weight', 'volume', 'Volume', 'toolSize', 'tool_size']:
@@ -50,24 +56,67 @@ def get_tasks_for_day(instance, start_days, day):
 def evaluate_cost(instance, schedule_by_day):
     return evaluate_cost_components(instance, schedule_by_day)["total"]
 
-def evaluate_cost_components(instance, schedule_by_day):
+def extract_start_days_from_schedule(instance, schedule):
+    start_days = {}
+    for day, trips in schedule.items():
+        for trip in trips:
+            route = trip["route"]
+            for node_id in route[1:-1]:
+                if node_id > 0 and node_id not in start_days:
+                    start_days[node_id] = day
+
+    if len(start_days) == len(instance.Requests):
+        return start_days
+    return None
+
+def calculate_tool_use_from_start_days(instance, start_days):
+    num_tools = len(instance.Tools)
+    daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 1)}
+
+    for req in instance.Requests:
+        if req.ID not in start_days:
+            continue
+        start_day = start_days[req.ID]
+        for day in active_tool_days(instance, req, start_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
+
+    if not daily_usage:
+        return [0] * num_tools
+    return [
+        max(usage[tool_idx] for usage in daily_usage.values())
+        for tool_idx in range(num_tools)
+    ]
+
+def calculate_validator_tool_use_from_schedule(instance, schedule_by_day):
+    # Matches validator/Validate.py: tools used are the maximum shortage in depot inventory
+    # implied by route loads and direct customer-to-customer reuse.
     num_tools = len(instance.Tools)
     simulated_inventory = [0] * num_tools
     min_inventory = [0] * num_tools
-    
+
     for day in sorted(schedule_by_day.keys()):
         trips = schedule_by_day[day]
         for trip in trips:
             for i in range(num_tools):
-                simulated_inventory[i] += trip["tools_loaded"][i] 
+                simulated_inventory[i] += trip["tools_loaded"][i]
         for i in range(num_tools):
             if simulated_inventory[i] < min_inventory[i]:
                 min_inventory[i] = simulated_inventory[i]
         for trip in trips:
             for i in range(num_tools):
-                simulated_inventory[i] += trip["tools_returned"][i] 
-                
-    tool_use = [abs(x) for x in min_inventory]
+                simulated_inventory[i] += trip["tools_returned"][i]
+
+    return [abs(x) for x in min_inventory]
+
+def evaluate_cost_components(instance, schedule_by_day):
+    num_tools = len(instance.Tools)
+    tool_use = calculate_validator_tool_use_from_schedule(instance, schedule_by_day)
+    start_days = extract_start_days_from_schedule(instance, schedule_by_day)
+    customer_tool_use = (
+        calculate_tool_use_from_start_days(instance, start_days)
+        if start_days is not None
+        else None
+    )
     tool_cost = sum(tool_use[i] * instance.Tools[i].cost for i in range(num_tools))
     
     max_vehicles = max((len(trips) for trips in schedule_by_day.values()), default=0)
@@ -93,13 +142,36 @@ def evaluate_cost_components(instance, schedule_by_day):
         "vehicle_day_count": vehicle_days,
         "total_distance": total_distance,
         "tool_use": tool_use,
+        "customer_tool_use": customer_tool_use,
     }
+
+def components_within_tool_limits(instance, components):
+    return all(
+        used <= instance.Tools[idx].amount
+        for idx, used in enumerate(components["tool_use"])
+    )
+
+def schedule_within_tool_limits(instance, schedule_by_day):
+    return components_within_tool_limits(
+        instance,
+        evaluate_cost_components(instance, schedule_by_day),
+    )
 
 def build_trips_from_state(instance, start_days):
     trips_by_day = {day: [] for day in range(1, instance.Days + 2)}
     for day in range(1, instance.Days + 2):
         tasks = get_tasks_for_day(instance, start_days, day)
         trips_by_day[day] = route_day(instance, tasks)
+    affected_days = [
+        day for day, trips in trips_by_day.items()
+        if trips
+    ]
+    trips_by_day = improve_affected_days_by_portfolio(
+        instance,
+        trips_by_day,
+        start_days,
+        affected_days,
+    )
     return trips_by_day
 
 def changed_request_ids(old_state, new_state):
@@ -136,6 +208,13 @@ def patch_trips_from_state(instance, current_trips, old_state, new_state):
     for day in affected_days:
         tasks = get_tasks_for_day(instance, new_state, day)
         patched_trips[day] = route_day(instance, tasks)
+
+    patched_trips = improve_affected_days_by_portfolio(
+        instance,
+        patched_trips,
+        new_state,
+        affected_days,
+    )
 
     return patched_trips, affected_days
 
@@ -353,6 +432,44 @@ def build_trip_from_tasks(instance, tasks):
 
     return build_trip_from_route(instance, route_nodes)
 
+def task_cache_key(tasks):
+    return tuple(
+        (task["req"].ID, task["type"])
+        for task in tasks
+    )
+
+def clone_trip(trip):
+    cloned = {
+        "route": list(trip["route"]),
+        "tools_loaded": list(trip["tools_loaded"]),
+        "tools_returned": list(trip["tools_returned"]),
+        "distance": trip["distance"],
+    }
+    if "visit_loads" in trip:
+        cloned["visit_loads"] = [list(visit) for visit in trip["visit_loads"]]
+    return cloned
+
+def clone_trips(trips):
+    return [clone_trip(trip) for trip in trips]
+
+def route_day_uncached(instance, tasks, method):
+    if method in ("regret", "regret_repair"):
+        trips = route_day_regret(instance, tasks)
+    elif method in ("insertion", "insertion_repair"):
+        trips = route_day_insertion(instance, tasks)
+    else:
+        trips = route_day_greedy(instance, tasks)
+
+    if method.endswith("_repair"):
+        return improve_day_routes(instance, trips)
+    return trips
+
+def route_day_with_method(instance, tasks, method):
+    cache_key = (method, task_cache_key(tasks))
+    if cache_key not in ROUTE_DAY_CACHE:
+        ROUTE_DAY_CACHE[cache_key] = route_day_uncached(instance, tasks, method)
+    return clone_trips(ROUTE_DAY_CACHE[cache_key])
+
 def route_day_insertion(instance, tasks):
     if not tasks:
         return []
@@ -412,10 +529,308 @@ def route_day_insertion(instance, tasks):
         for route_tasks in route_task_lists
     ]
 
+def route_reuse_bonus(instance, route_tasks):
+    available_by_tool = {}
+    bonus = 0
+
+    for task in route_tasks:
+        tool_idx = task["req"].tool - 1
+        amount = task["req"].toolCount
+        if task["type"] == "pickup":
+            available_by_tool[tool_idx] = available_by_tool.get(tool_idx, 0) + amount
+        else:
+            reused = min(available_by_tool.get(tool_idx, 0), amount)
+            if reused > 0:
+                bonus += reused * instance.Tools[tool_idx].cost
+                available_by_tool[tool_idx] -= reused
+
+    return bonus
+
+def trip_tool_load_cost(instance, trip):
+    return sum(
+        max(0, -amount) * instance.Tools[idx].cost
+        for idx, amount in enumerate(trip["tools_loaded"])
+    )
+
+def insertion_option_score(instance, old_trip, old_bonus, candidate_trip, candidate_tasks, creates_route):
+    old_distance = old_trip["distance"] if old_trip is not None else 0
+    distance_delta = candidate_trip["distance"] - old_distance
+    reuse_delta = route_reuse_bonus(instance, candidate_tasks) - old_bonus
+    old_tool_load = trip_tool_load_cost(instance, old_trip) if old_trip is not None else 0
+    tool_load_delta = trip_tool_load_cost(instance, candidate_trip) - old_tool_load
+    route_penalty = 0
+    if creates_route:
+        route_penalty = instance.VehicleDayCost + 0.05 * instance.VehicleCost
+
+    return (
+        distance_delta * instance.DistanceCost +
+        route_penalty -
+        0.05 * reuse_delta +
+        0.35 * tool_load_delta
+    )
+
+def best_regret_options_for_task(instance, route_task_lists, route_stats, task):
+    options = []
+
+    single_trip = build_trip_from_tasks(instance, [task])
+    if single_trip is not None:
+        score = insertion_option_score(
+            instance,
+            None,
+            0,
+            single_trip,
+            [task],
+            creates_route=True,
+        )
+        options.append((score, "new", None, None, [task], single_trip))
+
+    for route_idx, route_tasks in enumerate(route_task_lists):
+        old_trip, old_bonus = route_stats[route_idx]
+        for pos in range(len(route_tasks) + 1):
+            candidate_tasks = route_tasks[:pos] + [task] + route_tasks[pos:]
+            candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+            if candidate_trip is None:
+                continue
+
+            score = insertion_option_score(
+                instance,
+                old_trip,
+                old_bonus,
+                candidate_trip,
+                candidate_tasks,
+                creates_route=False,
+            )
+            options.append((score, "insert", route_idx, pos, candidate_tasks, candidate_trip))
+
+    options.sort(key=lambda option: option[0])
+    return options
+
+def route_day_regret(instance, tasks, regret_k=2):
+    if not tasks:
+        return []
+
+    unrouted = sorted(
+        tasks,
+        key=lambda task: (
+            -instance.calcDistance[instance.DepotCoordinate][task["req"].node],
+            -task["req"].toolCount * instance.Tools[task["req"].tool - 1].cost,
+        ),
+    )
+    route_task_lists = []
+
+    while unrouted:
+        route_stats = [
+            (build_trip_from_tasks(instance, route_tasks), route_reuse_bonus(instance, route_tasks))
+            for route_tasks in route_task_lists
+        ]
+        best_choice = None
+        best_priority = None
+
+        for task in unrouted:
+            options = best_regret_options_for_task(instance, route_task_lists, route_stats, task)
+            if not options:
+                continue
+
+            best_score = options[0][0]
+            comparison_idx = min(regret_k - 1, len(options) - 1)
+            regret = options[comparison_idx][0] - best_score
+            if len(options) == 1:
+                regret += instance.VehicleDayCost
+
+            priority = (
+                regret,
+                task["req"].toolCount * instance.Tools[task["req"].tool - 1].cost,
+                instance.calcDistance[instance.DepotCoordinate][task["req"].node],
+                -best_score,
+            )
+            if best_priority is None or priority > best_priority:
+                best_priority = priority
+                best_choice = (task, options[0])
+
+        if best_choice is None:
+            task = unrouted.pop(0)
+            route_task_lists.append([task])
+            continue
+
+        task, option = best_choice
+        _, move_type, route_idx, pos, candidate_tasks, _ = option
+        unrouted.remove(task)
+        if move_type == "new":
+            route_task_lists.append(candidate_tasks)
+        else:
+            route_task_lists[route_idx] = candidate_tasks
+
+    return [
+        build_trip_from_tasks(instance, route_tasks)
+        for route_tasks in route_task_lists
+    ]
+
+def trip_local_score(instance, trip):
+    tasks = route_to_tasks(instance, trip["route"])
+    return (
+        trip["distance"] * instance.DistanceCost
+        + 0.35 * trip_tool_load_cost(instance, trip)
+        - 0.05 * route_reuse_bonus(instance, tasks)
+    )
+
+def improve_trip_sequence(instance, trip, max_passes=2):
+    tasks = route_to_tasks(instance, trip["route"])
+    if len(tasks) < 2:
+        return trip
+
+    best_trip = trip
+    best_tasks = tasks
+    best_score = trip_local_score(instance, trip)
+
+    for _ in range(max_passes):
+        improved = False
+
+        for i in range(len(best_tasks)):
+            for j in range(i + 1, len(best_tasks)):
+                candidate_tasks = best_tasks.copy()
+                candidate_tasks[i], candidate_tasks[j] = candidate_tasks[j], candidate_tasks[i]
+                candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+                if candidate_trip is None:
+                    continue
+                candidate_score = trip_local_score(instance, candidate_trip)
+                if candidate_score < best_score:
+                    best_trip = candidate_trip
+                    best_tasks = candidate_tasks
+                    best_score = candidate_score
+                    improved = True
+
+        for i in range(len(best_tasks)):
+            task = best_tasks[i]
+            remaining = best_tasks[:i] + best_tasks[i + 1:]
+            for pos in range(len(remaining) + 1):
+                if pos == i:
+                    continue
+                candidate_tasks = remaining[:pos] + [task] + remaining[pos:]
+                candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+                if candidate_trip is None:
+                    continue
+                candidate_score = trip_local_score(instance, candidate_trip)
+                if candidate_score < best_score:
+                    best_trip = candidate_trip
+                    best_tasks = candidate_tasks
+                    best_score = candidate_score
+                    improved = True
+
+        if not improved:
+            break
+
+    return best_trip
+
+def day_route_score(instance, trips):
+    distance_cost = sum(trip["distance"] for trip in trips) * instance.DistanceCost
+    route_cost = len(trips) * (instance.VehicleDayCost + 0.05 * instance.VehicleCost)
+    tool_load_cost = sum(trip_tool_load_cost(instance, trip) for trip in trips)
+    reuse_bonus = sum(
+        route_reuse_bonus(instance, route_to_tasks(instance, trip["route"]))
+        for trip in trips
+    )
+    return route_cost + distance_cost + 0.35 * tool_load_cost - 0.05 * reuse_bonus
+
+def improve_day_routes(instance, trips):
+    if not trips:
+        return []
+
+    original_score = day_route_score(instance, trips)
+    improved_trips = [improve_trip_sequence(instance, trip) for trip in trips]
+
+    improved = True
+    while improved:
+        improved = False
+        best_move = None
+        best_score = day_route_score(instance, improved_trips)
+
+        for i in range(len(improved_trips)):
+            for j in range(i + 1, len(improved_trips)):
+                merged_trip = try_merge_trips(instance, improved_trips[i], improved_trips[j])
+                if merged_trip is None:
+                    continue
+                candidate_trips = [
+                    trip for idx, trip in enumerate(improved_trips)
+                    if idx not in (i, j)
+                ] + [improve_trip_sequence(instance, merged_trip)]
+                candidate_score = day_route_score(instance, candidate_trips)
+                if candidate_score < best_score:
+                    best_score = candidate_score
+                    best_move = candidate_trips
+
+        if best_move is not None:
+            improved_trips = best_move
+            improved = True
+
+    if day_route_score(instance, improved_trips) < original_score:
+        return improved_trips
+    return trips
+
 def route_day(instance, tasks):
-    if ROUTING_METHOD == "insertion":
-        return route_day_insertion(instance, tasks)
-    return route_day_greedy(instance, tasks)
+    return route_day_with_method(instance, tasks, ROUTING_METHOD)
+
+def route_signature(trips):
+    return tuple(tuple(trip["route"]) for trip in trips)
+
+def route_day_portfolio_candidates(instance, tasks):
+    if not tasks:
+        return [[]]
+
+    candidates = []
+    seen = set()
+
+    methods = ["greedy"]
+    if len(tasks) <= 36:
+        methods.append("insertion")
+    if len(tasks) <= 28:
+        methods.append("regret")
+
+    for method in methods:
+        trips = route_day_with_method(instance, tasks, method)
+        signature = route_signature(trips)
+        if signature not in seen:
+            candidates.append(trips)
+            seen.add(signature)
+
+        if len(tasks) <= 32:
+            repaired = route_day_with_method(instance, tasks, f"{method}_repair")
+            signature = route_signature(repaired)
+            if signature not in seen:
+                candidates.append(repaired)
+                seen.add(signature)
+
+    return candidates
+
+def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, affected_days):
+    improved_schedule = {
+        day: list(trips)
+        for day, trips in schedule_by_day.items()
+    }
+    best_components = evaluate_cost_components(instance, improved_schedule)
+    if not components_within_tool_limits(instance, best_components):
+        return improved_schedule
+
+    for day in sorted(affected_days):
+        tasks = get_tasks_for_day(instance, start_days, day)
+        best_trips_for_day = improved_schedule.get(day, [])
+        best_cost = best_components["total"]
+
+        for candidate_trips in route_day_portfolio_candidates(instance, tasks):
+            if route_signature(candidate_trips) == route_signature(best_trips_for_day):
+                continue
+            candidate_schedule = improved_schedule.copy()
+            candidate_schedule[day] = candidate_trips
+            candidate_components = evaluate_cost_components(instance, candidate_schedule)
+            if not components_within_tool_limits(instance, candidate_components):
+                continue
+            if candidate_components["total"] < best_cost:
+                best_cost = candidate_components["total"]
+                best_components = candidate_components
+                best_trips_for_day = candidate_trips
+
+        improved_schedule[day] = best_trips_for_day
+
+    return improved_schedule
 
 def route_distance(instance, tasks):
     if not tasks:
@@ -539,21 +954,203 @@ def merge_routes_postprocess(instance, schedule_by_day):
 
     return improved_schedule
 
-def generate_initial_solution(instance):
+def generate_baseline_start_days(instance):
     baseline_schedule = solve_baseline(instance)
-    
-    start_days = {}
-    for day, trips in baseline_schedule.items():
-        for trip in trips:
-            route = trip["route"]
-            for i in range(1, len(route) - 1):
-                req_id = abs(route[i])
-                if req_id > 0 and req_id not in start_days: 
-                    start_days[req_id] = day
-                    
-    if len(start_days) == len(instance.Requests):
+    start_days = extract_start_days_from_schedule(instance, baseline_schedule)
+    if start_days is not None:
         return start_days
-    
+    return {req.ID: req.fromDay for req in instance.Requests}
+
+def tool_peak_cost_from_usage(instance, daily_usage):
+    total = 0
+    for tool_idx, tool in enumerate(instance.Tools):
+        peak = max(usage[tool_idx] for usage in daily_usage.values())
+        total += peak * tool.cost
+    return total
+
+def generate_tool_balanced_start_days(instance):
+    num_tools = len(instance.Tools)
+    start_days = {}
+    daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
+    ordered_requests = sorted(
+        instance.Requests,
+        key=lambda req: (
+            -req.toolCount * instance.Tools[req.tool - 1].cost * req.numDays,
+            req.toDay - req.fromDay,
+        ),
+    )
+
+    for req in ordered_requests:
+        best_day = None
+        best_score = None
+        for candidate_day in range(req.fromDay, req.toDay + 1):
+            candidate_usage = {day: usage[:] for day, usage in daily_usage.items()}
+            feasible = True
+            for day in active_tool_days(instance, req, candidate_day):
+                candidate_usage[day][req.tool - 1] += req.toolCount
+                if candidate_usage[day][req.tool - 1] > instance.Tools[req.tool - 1].amount:
+                    feasible = False
+                    break
+            if not feasible:
+                continue
+
+            weighted_peak = tool_peak_cost_from_usage(instance, candidate_usage)
+            active_days = sum(1 for usage in candidate_usage.values() if any(usage))
+            score = (
+                weighted_peak,
+                active_days,
+                abs(candidate_day - ((req.fromDay + req.toDay) / 2)),
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_day = candidate_day
+
+        if best_day is None:
+            return None
+
+        start_days[req.ID] = best_day
+        for day in active_tool_days(instance, req, best_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
+
+    return start_days
+
+def generate_vehicle_day_clustered_start_days(instance):
+    num_tools = len(instance.Tools)
+    start_days = {}
+    daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
+    task_counts = {day: 0 for day in range(1, instance.Days + 2)}
+    ordered_requests = sorted(
+        instance.Requests,
+        key=lambda req: (req.toDay - req.fromDay, -req.toolCount),
+    )
+
+    for req in ordered_requests:
+        best_day = None
+        best_score = None
+        for candidate_day in range(req.fromDay, req.toDay + 1):
+            pickup_day = candidate_day + req.numDays
+            feasible = True
+            for day in active_tool_days(instance, req, candidate_day):
+                if daily_usage[day][req.tool - 1] + req.toolCount > instance.Tools[req.tool - 1].amount:
+                    feasible = False
+                    break
+            if not feasible:
+                continue
+
+            creates_delivery_day = 1 if task_counts[candidate_day] == 0 else 0
+            creates_pickup_day = 1 if pickup_day <= instance.Days and task_counts[pickup_day] == 0 else 0
+            delivery_pressure = task_counts[candidate_day]
+            pickup_pressure = task_counts[pickup_day] if pickup_day <= instance.Days else 0
+            score = (
+                creates_delivery_day + creates_pickup_day,
+                delivery_pressure + pickup_pressure,
+                tool_peak_cost_from_usage(instance, daily_usage),
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_day = candidate_day
+
+        if best_day is None:
+            return None
+
+        start_days[req.ID] = best_day
+        pickup_day = best_day + req.numDays
+        task_counts[best_day] += 1
+        if pickup_day <= instance.Days:
+            task_counts[pickup_day] += 1
+        for day in active_tool_days(instance, req, best_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
+
+    return start_days
+
+def generate_distance_clustered_start_days(instance):
+    num_tools = len(instance.Tools)
+    start_days = {}
+    daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
+    task_node_by_day = {day: [] for day in range(1, instance.Days + 2)}
+    ordered_requests = sorted(
+        instance.Requests,
+        key=lambda req: instance.calcDistance[instance.DepotCoordinate][req.node],
+        reverse=True,
+    )
+
+    for req in ordered_requests:
+        best_day = None
+        best_score = None
+        for candidate_day in range(req.fromDay, req.toDay + 1):
+            pickup_day = candidate_day + req.numDays
+            feasible = True
+            for day in active_tool_days(instance, req, candidate_day):
+                if daily_usage[day][req.tool - 1] + req.toolCount > instance.Tools[req.tool - 1].amount:
+                    feasible = False
+                    break
+            if not feasible:
+                continue
+
+            day_nodes = task_node_by_day[candidate_day]
+            pickup_nodes = task_node_by_day[pickup_day] if pickup_day <= instance.Days else []
+            if day_nodes:
+                delivery_cluster_dist = min(instance.calcDistance[req.node][node] for node in day_nodes)
+            else:
+                delivery_cluster_dist = instance.calcDistance[instance.DepotCoordinate][req.node]
+            if pickup_nodes:
+                pickup_cluster_dist = min(instance.calcDistance[req.node][node] for node in pickup_nodes)
+            else:
+                pickup_cluster_dist = instance.calcDistance[instance.DepotCoordinate][req.node]
+            score = (
+                delivery_cluster_dist + pickup_cluster_dist,
+                len(day_nodes) + len(pickup_nodes),
+                tool_peak_cost_from_usage(instance, daily_usage),
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_day = candidate_day
+
+        if best_day is None:
+            return None
+
+        start_days[req.ID] = best_day
+        pickup_day = best_day + req.numDays
+        task_node_by_day[best_day].append(req.node)
+        if pickup_day <= instance.Days:
+            task_node_by_day[pickup_day].append(req.node)
+        for day in active_tool_days(instance, req, best_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
+
+    return start_days
+
+def generate_initial_solution(instance):
+    candidates = [
+        ("baseline", generate_baseline_start_days(instance)),
+        ("tool-balanced", generate_tool_balanced_start_days(instance)),
+        ("vehicle-day-clustered", generate_vehicle_day_clustered_start_days(instance)),
+        ("distance-clustered", generate_distance_clustered_start_days(instance)),
+    ]
+
+    best_name = None
+    best_state = None
+    best_cost = None
+
+    for name, start_days in candidates:
+        if start_days is None or len(start_days) != len(instance.Requests):
+            continue
+        if not is_schedule_feasible(instance, start_days):
+            continue
+        schedule = build_trips_from_state(instance, start_days)
+        components = evaluate_cost_components(instance, schedule)
+        if not components_within_tool_limits(instance, components):
+            continue
+        cost = components["total"]
+        if best_cost is None or cost < best_cost:
+            best_name = name
+            best_state = start_days
+            best_cost = cost
+
+    if best_state is not None:
+        print(f"      [SA] Selected initial strategy: {best_name} ({best_cost:,.0f})")
+        return best_state
+
+    print("      [SA] Warning: all strategy starts failed; falling back to earliest days.")
     return {req.ID: req.fromDay for req in instance.Requests}
 
 def calculate_daily_tool_usage(instance, start_days):
@@ -561,9 +1158,8 @@ def calculate_daily_tool_usage(instance, start_days):
     daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
     for req in instance.Requests:
         start_day = start_days[req.ID]
-        for day in range(start_day, start_day + req.numDays + 1):
-            if day <= instance.Days:
-                daily_usage[day][req.tool - 1] += req.toolCount
+        for day in active_tool_days(instance, req, start_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
     return daily_usage
 
 def calculate_partial_daily_tool_usage(instance, partial_state):
@@ -573,9 +1169,8 @@ def calculate_partial_daily_tool_usage(instance, partial_state):
         if req.ID not in partial_state:
             continue
         start_day = partial_state[req.ID]
-        for day in range(start_day, start_day + req.numDays + 1):
-            if day <= instance.Days:
-                daily_usage[day][req.tool - 1] += req.toolCount
+        for day in active_tool_days(instance, req, start_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
     return daily_usage
 
 def is_partial_schedule_feasible(instance, partial_state):
@@ -608,6 +1203,100 @@ def dominant_cost_part(components):
     }
     return max(parts, key=parts.get)
 
+def component_pressure(instance, components):
+    total = max(1, components["total"])
+    return {
+        "tools": components["tools"] / total,
+        "vehicle_days": components["vehicle_days"] / total,
+        "fixed_vehicle": components["fixed_vehicle"] / total,
+        "distance": components["distance"] / total,
+    }
+
+def weighted_tool_use_cost(instance, tool_use):
+    return sum(
+        amount * instance.Tools[idx].cost
+        for idx, amount in enumerate(tool_use)
+    )
+
+def weighted_tool_regression(instance, old_components, new_components):
+    return sum(
+        max(0, new - old) * instance.Tools[idx].cost
+        for idx, (new, old) in enumerate(zip(new_components["tool_use"], old_components["tool_use"]))
+    )
+
+def is_clearly_dominant(pressure, dominant_part):
+    dominant_pressure = pressure.get(dominant_part, 0)
+    other_pressures = [
+        value for part, value in pressure.items()
+        if part != dominant_part
+    ]
+    second_pressure = max(other_pressures, default=0)
+    return dominant_pressure >= 0.30 and dominant_pressure >= second_pressure + 0.05
+
+def component_regression_cost(instance, dominant_part, old_components, new_components):
+    if dominant_part == "tools":
+        return weighted_tool_regression(instance, old_components, new_components)
+
+    if dominant_part == "vehicle_days":
+        extra_days = new_components["vehicle_day_count"] - old_components["vehicle_day_count"]
+        return max(0, extra_days) * instance.VehicleDayCost
+
+    if dominant_part == "fixed_vehicle":
+        extra_vehicles = new_components["max_vehicles"] - old_components["max_vehicles"]
+        return max(0, extra_vehicles) * instance.VehicleCost
+
+    if dominant_part == "distance":
+        extra_distance = new_components["total_distance"] - old_components["total_distance"]
+        return max(0, extra_distance) * instance.DistanceCost
+
+    return 0
+
+def component_guard_budget(old_components, dominant_part, pressure, temperature):
+    total = max(1, old_components["total"])
+    hotness = min(1.0, max(0.0, temperature / max(1.0, total * 0.002)))
+    dominance = pressure.get(dominant_part, 0)
+    strictness = max(0.35, 1.10 - dominance)
+
+    base_ratios = {
+        "tools": 0.00035,
+        "vehicle_days": 0.00020,
+        "fixed_vehicle": 0.00020,
+        "distance": 0.00050,
+    }
+    hot_ratios = {
+        "tools": 0.00150,
+        "vehicle_days": 0.00100,
+        "fixed_vehicle": 0.00100,
+        "distance": 0.00200,
+    }
+
+    ratio = base_ratios.get(dominant_part, 0.00025) + hotness * hot_ratios.get(dominant_part, 0.001)
+    budget_from_total = total * ratio * strictness
+    budget_from_temperature = temperature * (0.20 + 0.40 * hotness)
+    return max(1.0, budget_from_total, budget_from_temperature)
+
+def component_guard_allows(instance, dominant_part, old_components, new_components, temperature):
+    if new_components["total"] <= old_components["total"]:
+        return True
+
+    pressure = component_pressure(instance, old_components)
+    if dominant_part == "distance":
+        return True
+
+    if not is_clearly_dominant(pressure, dominant_part):
+        return True
+
+    regression = component_regression_cost(instance, dominant_part, old_components, new_components)
+    if regression <= 0:
+        return True
+
+    return regression <= component_guard_budget(
+        old_components,
+        dominant_part,
+        pressure,
+        temperature,
+    )
+
 def requests_touching_day(instance, start_days, day):
     candidates = []
     for req in instance.Requests:
@@ -617,7 +1306,63 @@ def requests_touching_day(instance, start_days, day):
             candidates.append(req)
     return candidates
 
-def choose_peak_tool_request(instance, start_days):
+def validator_tool_peak_day(instance, schedule_by_day):
+    tool_status = [0] * len(instance.Tools)
+    tool_use = [0] * len(instance.Tools)
+    peak_day_by_tool = [None] * len(instance.Tools)
+
+    for day in sorted(schedule_by_day.keys()):
+        for trip in schedule_by_day[day]:
+            tool_status = [
+                current + loaded
+                for current, loaded in zip(tool_status, trip["tools_loaded"])
+            ]
+        for tool_idx, current in enumerate(tool_status):
+            shortage = max(0, -current)
+            if shortage > tool_use[tool_idx]:
+                tool_use[tool_idx] = shortage
+                peak_day_by_tool[tool_idx] = day
+        for trip in schedule_by_day[day]:
+            tool_status = [
+                current + returned
+                for current, returned in zip(tool_status, trip["tools_returned"])
+            ]
+
+    if not tool_use:
+        return None, None
+
+    peak_tool_idx = max(
+        range(len(instance.Tools)),
+        key=lambda idx: tool_use[idx] * instance.Tools[idx].cost,
+    )
+    return peak_tool_idx, peak_day_by_tool[peak_tool_idx]
+
+def active_tool_requests_on_day(instance, start_days, day, tool_idx):
+    if day is None:
+        return []
+
+    candidates = []
+    for req in instance.Requests:
+        if req.tool - 1 != tool_idx:
+            continue
+        start_day = start_days[req.ID]
+        if start_day <= day <= start_day + req.numDays:
+            candidates.append(req)
+    return candidates
+
+def choose_peak_tool_request(instance, start_days, current_trips=None):
+    if current_trips is not None:
+        peak_tool_idx, peak_day = validator_tool_peak_day(instance, current_trips)
+        candidates = active_tool_requests_on_day(instance, start_days, peak_day, peak_tool_idx)
+        if candidates:
+            return max(
+                candidates,
+                key=lambda req: (
+                    req.toolCount * instance.Tools[req.tool - 1].cost,
+                    req.toDay - req.fromDay,
+                ),
+            )
+
     daily_usage = calculate_daily_tool_usage(instance, start_days)
     best_score = None
     peak_day = None
@@ -760,7 +1505,7 @@ def propose_cost_aware_neighbor(instance, current_state, current_trips, componen
         return propose_group_shift(instance, current_state)
 
     if dominant_part == "tools":
-        req = choose_peak_tool_request(instance, current_state)
+        req = choose_peak_tool_request(instance, current_state, current_trips)
         return propose_best_tool_move(instance, current_state, req)
 
     if dominant_part in ("vehicle_days", "fixed_vehicle"):
@@ -778,8 +1523,16 @@ def choose_destroy_requests(instance, current_state, current_trips, components, 
     destroy_size = max(1, min(destroy_size, len(instance.Requests)))
 
     if dominant_part == "tools":
-        anchor = choose_peak_tool_request(instance, current_state)
-        candidates = [anchor] + nearby_related_requests(instance, anchor, limit=destroy_size * 2)
+        peak_tool_idx, peak_day = validator_tool_peak_day(instance, current_trips)
+        peak_candidates = active_tool_requests_on_day(instance, current_state, peak_day, peak_tool_idx)
+        peak_candidates.sort(
+            key=lambda req: (
+                -req.toolCount * instance.Tools[req.tool - 1].cost,
+                req.toDay - req.fromDay,
+            )
+        )
+        anchor = peak_candidates[0] if peak_candidates else choose_peak_tool_request(instance, current_state, current_trips)
+        candidates = peak_candidates + nearby_related_requests(instance, anchor, limit=destroy_size * 2)
     elif dominant_part in ("vehicle_days", "fixed_vehicle"):
         anchor = choose_busy_day_request(instance, current_state, current_trips)
         day = current_state[anchor.ID]
@@ -834,13 +1587,13 @@ def score_completed_schedule(instance, schedule, dominant_part, reference_compon
 
     return components["total"], components
 
-def partial_repair_score(instance, partial_state, dominant_part):
+def partial_repair_score(instance, partial_state, dominant_part, exact_days=None):
     daily_usage = calculate_partial_daily_tool_usage(instance, partial_state)
     tool_use = [
         max(usage[tool_idx] for usage in daily_usage.values())
         for tool_idx in range(len(instance.Tools))
     ]
-    tool_cost = sum(tool_use[i] * instance.Tools[i].cost for i in range(len(instance.Tools)))
+    tool_cost = weighted_tool_use_cost(instance, tool_use)
 
     task_counts_by_day = {day: 0 for day in range(1, instance.Days + 2)}
     distance_roundtrip_proxy = 0
@@ -857,25 +1610,53 @@ def partial_repair_score(instance, partial_state, dominant_part):
 
     task_day_proxy = sum(task_counts_by_day.values())
     max_task_day_proxy = max(task_counts_by_day.values(), default=0)
+    exact_days = set(exact_days or [])
+
+    exact_vehicle_days = 0
+    exact_max_vehicles = 0
+    exact_distance = 0
+    exact_task_day_proxy = 0
+    if exact_days:
+        for day in exact_days:
+            if day < 1 or day > instance.Days + 1:
+                continue
+            tasks = get_partial_tasks_for_day(instance, partial_state, day)
+            exact_task_day_proxy += len(tasks)
+            trips = route_day(instance, tasks)
+            exact_vehicle_days += len(trips)
+            exact_max_vehicles = max(exact_max_vehicles, len(trips))
+            exact_distance += sum(trip["distance"] for trip in trips)
+
+    mixed_task_day_proxy = max(0, task_day_proxy - exact_task_day_proxy) + exact_vehicle_days
+    mixed_max_vehicle_proxy = max(
+        exact_max_vehicles,
+        max(
+            (
+                count for day, count in task_counts_by_day.items()
+                if day not in exact_days
+            ),
+            default=0,
+        ),
+    )
 
     if dominant_part == "tools":
         return (
             tool_cost +
-            0.05 * task_day_proxy * instance.VehicleDayCost +
+            0.05 * mixed_task_day_proxy * instance.VehicleDayCost +
             0.01 * distance_roundtrip_proxy * instance.DistanceCost
         )
 
     if dominant_part == "vehicle_days":
         return (
-            task_day_proxy * instance.VehicleDayCost +
-            0.2 * max_task_day_proxy * instance.VehicleCost +
+            mixed_task_day_proxy * instance.VehicleDayCost +
+            0.2 * mixed_max_vehicle_proxy * instance.VehicleCost +
             0.05 * tool_cost
         )
 
     if dominant_part == "fixed_vehicle":
         return (
-            max_task_day_proxy * instance.VehicleCost +
-            0.2 * task_day_proxy * instance.VehicleDayCost +
+            mixed_max_vehicle_proxy * instance.VehicleCost +
+            0.2 * mixed_task_day_proxy * instance.VehicleDayCost +
             0.05 * tool_cost
         )
 
@@ -907,7 +1688,8 @@ def best_request_insertions(instance, repaired_state, req, dominant_part):
         candidate_state[req.ID] = candidate_day
         if not is_partial_schedule_feasible(instance, candidate_state):
             continue
-        score = partial_repair_score(instance, candidate_state, dominant_part)
+        exact_days = {candidate_day, candidate_day + req.numDays}
+        score = partial_repair_score(instance, candidate_state, dominant_part, exact_days=exact_days)
         options.append((score, candidate_day))
 
     options.sort(key=lambda item: item[0])
@@ -936,7 +1718,8 @@ def repair_destroyed_requests_greedy(instance, current_state, removed_requests, 
             if not is_partial_schedule_feasible(instance, candidate_state):
                 continue
 
-            score = partial_repair_score(instance, candidate_state, dominant_part)
+            exact_days = {candidate_day, candidate_day + req.numDays}
+            score = partial_repair_score(instance, candidate_state, dominant_part, exact_days=exact_days)
             if best_score is None or score < best_score:
                 best_score = score
                 best_day = candidate_day
@@ -989,10 +1772,28 @@ def repair_destroyed_requests(instance, current_state, removed_requests, dominan
         return repair_destroyed_requests_regret(instance, current_state, removed_requests, dominant_part)
     return repair_destroyed_requests_greedy(instance, current_state, removed_requests, dominant_part)
 
-def run_alns(instance, initial_state, iterations=250, destroy_fraction=0.06, strategy="auto", repair_method="auto"):
+def adaptive_destroy_size(base_size, request_count, iterations_without_improvement):
+    if iterations_without_improvement >= 50:
+        multiplier = 3
+    elif iterations_without_improvement >= 20:
+        multiplier = 2
+    else:
+        multiplier = 1
+
+    cap = max(base_size, int(request_count * 0.20))
+    return max(1, min(base_size * multiplier, cap, request_count))
+
+def run_alns(instance, initial_state, initial_trips=None, iterations=250, destroy_fraction=0.06, strategy="auto", repair_method="auto"):
     current_state = initial_state.copy()
-    current_trips = build_trips_from_state(instance, current_state)
+    current_trips = (
+        {day: clone_trips(trips) for day, trips in initial_trips.items()}
+        if initial_trips is not None
+        else build_trips_from_state(instance, current_state)
+    )
     current_components = evaluate_cost_components(instance, current_trips)
+    if not components_within_tool_limits(instance, current_components):
+        print("      [ALNS] Initial route plan exceeds validator tool limits; skipping repair search.")
+        return current_trips, current_state
     current_cost = current_components["total"]
     initial_dominant_part = dominant_cost_part(current_components) if strategy == "auto" else strategy
 
@@ -1013,16 +1814,22 @@ def run_alns(instance, initial_state, iterations=250, destroy_fraction=0.06, str
     best_cost = current_cost
     best_score = current_score
 
-    destroy_size = max(2, int(len(instance.Requests) * destroy_fraction))
+    base_destroy_size = max(2, int(len(instance.Requests) * destroy_fraction))
     temperature = max(1000.0, current_cost * 0.001)
     cooling_rate = 0.995
+    iterations_without_improvement = 0
 
     print(f"      [ALNS] Starting repair search. Initial Estimated Cost: {current_cost:,.0f}")
     print(f"      [ALNS] Strategy: {initial_dominant_part}")
     print(f"      [ALNS] Repair: {selected_repair_method}")
-    print(f"      [ALNS] Destroy size: {destroy_size}, iterations: {iterations}")
+    print(f"      [ALNS] Base destroy size: {base_destroy_size}, iterations: {iterations}")
 
     for iteration in range(max(0, int(iterations))):
+        destroy_size = adaptive_destroy_size(
+            base_destroy_size,
+            len(instance.Requests),
+            iterations_without_improvement,
+        )
         removed = choose_destroy_requests(
             instance,
             current_state,
@@ -1043,6 +1850,9 @@ def run_alns(instance, initial_state, iterations=250, destroy_fraction=0.06, str
 
         new_trips, _ = patch_trips_from_state(instance, current_trips, current_state, new_state)
         new_components = evaluate_cost_components(instance, new_trips)
+        if not components_within_tool_limits(instance, new_components):
+            temperature *= cooling_rate
+            continue
         new_cost = new_components["total"]
         new_score, new_components = score_completed_schedule(
             instance,
@@ -1051,10 +1861,17 @@ def run_alns(instance, initial_state, iterations=250, destroy_fraction=0.06, str
             current_components,
         )
 
-        accept = new_score < current_score
+        guard_allows = component_guard_allows(
+            instance,
+            initial_dominant_part,
+            current_components,
+            new_components,
+            temperature,
+        )
+        accept = guard_allows and new_score < current_score
         if not accept:
             delta = new_score - current_score
-            accept = random.random() < math.exp(-delta / max(temperature, 1.0))
+            accept = guard_allows and random.random() < math.exp(-delta / max(temperature, 1.0))
 
         if accept:
             current_state = new_state
@@ -1068,12 +1885,51 @@ def run_alns(instance, initial_state, iterations=250, destroy_fraction=0.06, str
             best_trips = new_trips
             best_cost = new_cost
             best_score = new_score
+            iterations_without_improvement = 0
             print(f"      [ALNS] Iteration {iteration + 1}: new best {best_cost:,.0f}")
+        else:
+            iterations_without_improvement += 1
 
         temperature *= cooling_rate
 
     print(f"      [ALNS] Complete. Best Estimated Cost: {best_cost:,.0f}")
     return best_trips, best_state
+
+def estimate_initial_temperature(instance, current_state, current_trips, current_components, samples=35, target_acceptance=0.65):
+    uphill_deltas = []
+    current_cost = current_components["total"]
+    floor_temperature = max(1000.0, current_cost * 0.01)
+    cap_temperature = max(floor_temperature, current_cost * 0.05)
+
+    for _ in range(samples):
+        new_state = propose_cost_aware_neighbor(
+            instance,
+            current_state,
+            current_trips,
+            current_components,
+        )
+        if new_state is None or not is_schedule_feasible(instance, new_state):
+            continue
+
+        new_trips, _ = patch_trips_from_state(instance, current_trips, current_state, new_state)
+        new_components = evaluate_cost_components(instance, new_trips)
+        if not components_within_tool_limits(instance, new_components):
+            continue
+
+        delta = new_components["total"] - current_cost
+        if delta > 0:
+            uphill_deltas.append(delta)
+
+    if not uphill_deltas:
+        return floor_temperature
+
+    uphill_deltas.sort()
+    median_delta = uphill_deltas[len(uphill_deltas) // 2]
+    temperature = -median_delta / math.log(target_acceptance)
+    return min(
+        max(floor_temperature, temperature),
+        cap_temperature,
+    )
 
 def solve_sa_single(instance, return_state=False, initial_state=None):
     calculate_all_distances(instance)
@@ -1088,19 +1944,27 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
 
     current_trips = build_trips_from_state(instance, current_state)
     current_components = evaluate_cost_components(instance, current_trips)
+    if not components_within_tool_limits(instance, current_components):
+        print("      [SA] Warning: Initial route plan exceeds validator tool limits.")
     current_cost = current_components["total"]
     
     best_state = current_state.copy()
     best_cost = current_cost
     best_trips = {k: v.copy() for k, v in current_trips.items()}
     
-    temperature = 5000.0
-    cooling_rate = 0.95
-    min_temperature = 1.0
-    iterations_per_temp = 10
+    temperature = estimate_initial_temperature(
+        instance,
+        current_state,
+        current_trips,
+        current_components,
+    )
+    cooling_rate = 0.92
+    min_temperature = max(1.0, temperature * 0.002)
+    iterations_per_temp = 8
     
     print(f"      [SA] Starting Annealing. Initial Estimated Cost: {current_cost:,.0f}")
     print(f"      [SA] Initial dominant cost part: {dominant_cost_part(current_components)}")
+    print(f"      [SA] Initial temperature: {temperature:,.0f}")
     
     while temperature > min_temperature:
         for _ in range(iterations_per_temp):
@@ -1113,6 +1977,8 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
 
             new_trips, _ = patch_trips_from_state(instance, current_trips, current_state, new_state)
             new_components = evaluate_cost_components(instance, new_trips)
+            if not components_within_tool_limits(instance, new_components):
+                continue
             new_cost = new_components["total"]
             
             if new_cost < current_cost:
@@ -1125,6 +1991,14 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
                     best_state = current_state.copy()
                     best_trips = {k: v.copy() for k, v in current_trips.items()}
             else:
+                if not component_guard_allows(
+                    instance,
+                    dominant_cost_part(current_components),
+                    current_components,
+                    new_components,
+                    temperature,
+                ):
+                    continue
                 delta = new_cost - current_cost
                 probability = math.exp(-delta / temperature)
                 if random.random() < probability:
@@ -1153,6 +2027,7 @@ def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method="gree
             schedule, state = run_alns(
                 instance,
                 state,
+                initial_trips=schedule,
                 iterations=alns_iterations,
                 destroy_fraction=alns_destroy_fraction,
                 strategy=alns_strategy,
@@ -1177,6 +2052,7 @@ def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method="gree
             schedule, state = run_alns(
                 instance,
                 state,
+                initial_trips=schedule,
                 iterations=alns_iterations,
                 destroy_fraction=alns_destroy_fraction,
                 strategy=alns_strategy,

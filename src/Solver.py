@@ -169,7 +169,7 @@ def main():
     )
     parser.add_argument(
         "--routing-method",
-        choices=("greedy", "insertion"),
+        choices=("greedy", "insertion", "regret", "greedy_repair", "insertion_repair", "regret_repair"),
         default="greedy",
         help="Daily route construction method for simulated annealing.",
     )

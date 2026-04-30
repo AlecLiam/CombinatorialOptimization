@@ -1,24 +1,43 @@
 import os
 
-def write_solution(instance, schedule_by_day, file_path, solution_name="solution"):
+def active_tool_days(instance, req, start_day):
+    last_active_day = min(start_day + req.numDays, instance.Days)
+    return range(start_day, last_active_day + 1)
+
+def extract_start_days_from_schedule(instance, schedule_by_day):
+    start_days = {}
+    for day, trips in schedule_by_day.items():
+        for trip in trips:
+            for node_id in trip["route"][1:-1]:
+                if node_id > 0 and node_id not in start_days:
+                    start_days[node_id] = day
+    return start_days
+
+def calculate_tool_use(instance, schedule_by_day):
+    # Keep this aligned with validator/Validate.py so written COST and TOOL_USE
+    # are accepted as the official submitted solution information.
     num_tools = len(instance.Tools)
     simulated_inventory = [0] * num_tools
     min_inventory = [0] * num_tools
-    
+
     for day in sorted(schedule_by_day.keys()):
         trips = schedule_by_day[day]
         for trip in trips:
             for i in range(num_tools):
-                simulated_inventory[i] += trip["tools_loaded"][i] 
+                simulated_inventory[i] += trip["tools_loaded"][i]
         for i in range(num_tools):
             if simulated_inventory[i] < min_inventory[i]:
                 min_inventory[i] = simulated_inventory[i]
         for trip in trips:
             for i in range(num_tools):
-                simulated_inventory[i] += trip["tools_returned"][i] 
-                
-    tool_use = [abs(x) for x in min_inventory]
-    
+                simulated_inventory[i] += trip["tools_returned"][i]
+
+    return [abs(x) for x in min_inventory]
+
+def write_solution(instance, schedule_by_day, file_path, solution_name="solution"):
+    num_tools = len(instance.Tools)
+    tool_use = calculate_tool_use(instance, schedule_by_day)
+
     max_vehicles = max((len(trips) for trips in schedule_by_day.values()), default=0)
     vehicle_days = sum(len(trips) for trips in schedule_by_day.values())
     total_distance = sum(trip["distance"] for trips in schedule_by_day.values() for trip in trips)
