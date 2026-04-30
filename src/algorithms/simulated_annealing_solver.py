@@ -1435,10 +1435,10 @@ def propose_single_move(instance, current_state, req=None):
     new_state[req.ID] = random.choice(possible_days)
     return new_state
 
-def propose_best_tool_move(instance, current_state, req):
+def propose_best_tool_move(instance, current_state, req, current_trips=None, current_components=None):
     old_start = current_state[req.ID]
     best_state = None
-    best_tool_cost = None
+    best_score = current_components["total"] if current_components is not None else None
 
     for candidate_day in range(req.fromDay, req.toDay + 1):
         if candidate_day == old_start:
@@ -1447,14 +1447,33 @@ def propose_best_tool_move(instance, current_state, req):
         candidate_state[req.ID] = candidate_day
         if not is_schedule_feasible(instance, candidate_state):
             continue
-        daily_usage = calculate_daily_tool_usage(instance, candidate_state)
-        tool_use = [
-            max(usage[tool_idx] for usage in daily_usage.values())
-            for tool_idx in range(len(instance.Tools))
-        ]
-        tool_cost = sum(tool_use[i] * instance.Tools[i].cost for i in range(len(instance.Tools)))
-        if best_tool_cost is None or tool_cost < best_tool_cost:
-            best_tool_cost = tool_cost
+
+        if current_trips is not None and current_components is not None:
+            candidate_trips, _ = patch_trips_from_state(
+                instance,
+                current_trips,
+                current_state,
+                candidate_state,
+            )
+            candidate_components = evaluate_cost_components(instance, candidate_trips)
+            if not components_within_tool_limits(instance, candidate_components):
+                continue
+            score, _ = score_completed_schedule(
+                instance,
+                candidate_trips,
+                "tools",
+                current_components,
+            )
+        else:
+            daily_usage = calculate_daily_tool_usage(instance, candidate_state)
+            tool_use = [
+                max(usage[tool_idx] for usage in daily_usage.values())
+                for tool_idx in range(len(instance.Tools))
+            ]
+            score = weighted_tool_use_cost(instance, tool_use)
+
+        if best_score is None or score < best_score:
+            best_score = score
             best_state = candidate_state
 
     return best_state
@@ -1506,7 +1525,13 @@ def propose_cost_aware_neighbor(instance, current_state, current_trips, componen
 
     if dominant_part == "tools":
         req = choose_peak_tool_request(instance, current_state, current_trips)
-        return propose_best_tool_move(instance, current_state, req)
+        return propose_best_tool_move(
+            instance,
+            current_state,
+            req,
+            current_trips=current_trips,
+            current_components=components,
+        )
 
     if dominant_part in ("vehicle_days", "fixed_vehicle"):
         req = choose_busy_day_request(instance, current_state, current_trips)
@@ -1695,6 +1720,46 @@ def best_request_insertions(instance, repaired_state, req, dominant_part):
     options.sort(key=lambda item: item[0])
     return options
 
+def exact_request_insertions(
+    instance,
+    current_state,
+    current_trips,
+    repaired_state,
+    req,
+    dominant_part,
+    reference_components,
+):
+    options = []
+    days = list(range(req.fromDay, req.toDay + 1))
+    random.shuffle(days)
+
+    for candidate_day in days:
+        candidate_state = repaired_state.copy()
+        candidate_state[req.ID] = candidate_day
+        if not is_schedule_feasible(instance, candidate_state):
+            continue
+
+        candidate_trips, _ = patch_trips_from_state(
+            instance,
+            current_trips,
+            current_state,
+            candidate_state,
+        )
+        candidate_components = evaluate_cost_components(instance, candidate_trips)
+        if not components_within_tool_limits(instance, candidate_components):
+            continue
+
+        score, candidate_components = score_completed_schedule(
+            instance,
+            candidate_trips,
+            dominant_part,
+            reference_components,
+        )
+        options.append((score, candidate_day, candidate_components))
+
+    options.sort(key=lambda item: item[0])
+    return options
+
 def repair_destroyed_requests_greedy(instance, current_state, removed_requests, dominant_part):
     partial_state = current_state.copy()
     for req in removed_requests:
@@ -1767,7 +1832,88 @@ def repair_destroyed_requests_regret(instance, current_state, removed_requests, 
 
     return repaired_state
 
-def repair_destroyed_requests(instance, current_state, removed_requests, dominant_part, repair_method="greedy"):
+def repair_destroyed_requests_exact_regret(
+    instance,
+    current_state,
+    current_trips,
+    current_components,
+    removed_requests,
+    dominant_part,
+    regret_k=2,
+):
+    repaired_state = current_state.copy()
+    uninserted = list(removed_requests)
+
+    while uninserted:
+        best_choice = None
+        best_priority = None
+
+        for req in uninserted:
+            options = exact_request_insertions(
+                instance,
+                current_state,
+                current_trips,
+                repaired_state,
+                req,
+                dominant_part,
+                current_components,
+            )
+            if not options:
+                return None
+
+            best_score = options[0][0]
+            comparison_idx = min(regret_k - 1, len(options) - 1)
+            regret = options[comparison_idx][0] - best_score
+            if len(options) == 1:
+                regret += abs(best_score) + 1
+
+            best_components = options[0][2]
+            tool_improvement = current_components["tools"] - best_components["tools"]
+            total_improvement = current_components["total"] - best_components["total"]
+            priority = (
+                regret,
+                tool_improvement,
+                total_improvement,
+                req.toolCount * instance.Tools[req.tool - 1].cost,
+                -(req.toDay - req.fromDay),
+            )
+
+            if best_priority is None or priority > best_priority:
+                best_priority = priority
+                best_choice = (req, options[0][1])
+
+        req, best_day = best_choice
+        repaired_state[req.ID] = best_day
+        uninserted.remove(req)
+
+    return repaired_state
+
+def repair_destroyed_requests(
+    instance,
+    current_state,
+    removed_requests,
+    dominant_part,
+    repair_method="greedy",
+    current_trips=None,
+    current_components=None,
+):
+    if (
+        dominant_part == "tools"
+        and current_trips is not None
+        and current_components is not None
+        and len(removed_requests) <= 12
+    ):
+        exact_state = repair_destroyed_requests_exact_regret(
+            instance,
+            current_state,
+            current_trips,
+            current_components,
+            removed_requests,
+            dominant_part,
+        )
+        if exact_state is not None:
+            return exact_state
+
     if repair_method == "regret":
         return repair_destroyed_requests_regret(instance, current_state, removed_requests, dominant_part)
     return repair_destroyed_requests_greedy(instance, current_state, removed_requests, dominant_part)
@@ -1843,6 +1989,8 @@ def run_alns(instance, initial_state, initial_trips=None, iterations=250, destro
             removed,
             initial_dominant_part,
             repair_method=selected_repair_method,
+            current_trips=current_trips,
+            current_components=current_components,
         )
         if new_state is None or not is_schedule_feasible(instance, new_state):
             temperature *= cooling_rate
