@@ -5,6 +5,25 @@ from algorithms.baseline_solver import solve_baseline
 ROUTING_METHOD = "greedy"
 ROUTE_DAY_CACHE = {}
 
+class SolverContext:
+    def __init__(self, instance):
+        self.requests = list(instance.Requests)
+        self.requests_by_id = {req.ID: req for req in self.requests}
+        self.tool_sizes = [get_tool_size(tool) for tool in instance.Tools]
+        self.tool_costs = [tool.cost for tool in instance.Tools]
+        self.tool_amounts = [tool.amount for tool in instance.Tools]
+        self.num_tools = len(instance.Tools)
+        self.depot = instance.DepotCoordinate
+        self.extended_days = list(range(1, instance.Days + 2))
+        self.planning_days = list(range(1, instance.Days + 1))
+
+def get_context(instance):
+    context = getattr(instance, "_solver_context", None)
+    if context is None:
+        context = SolverContext(instance)
+        setattr(instance, "_solver_context", context)
+    return context
+
 def set_routing_method(method):
     global ROUTING_METHOD, ROUTE_DAY_CACHE
     if method not in ("greedy", "insertion", "regret", "greedy_repair", "insertion_repair", "regret_repair"):
@@ -43,15 +62,24 @@ def get_tool_size(tool):
     return 1
 
 def get_tasks_for_day(instance, start_days, day):
-    tasks = []
-    for req in instance.Requests:
+    return build_tasks_by_day(instance, start_days, days=[day]).get(day, [])
+
+def build_tasks_by_day(instance, start_days, days=None):
+    ctx = get_context(instance)
+    if days is None:
+        days = ctx.extended_days
+    day_set = set(days)
+    tasks_by_day = {day: [] for day in day_set}
+
+    for req in ctx.requests:
         sd = start_days[req.ID]
-        if sd == day:
-            tasks.append({"req": req, "type": "delivery"})
+        if sd in day_set:
+            tasks_by_day[sd].append({"req": req, "type": "delivery"})
         pd = sd + req.numDays
-        if pd == day and pd <= instance.Days:
-            tasks.append({"req": req, "type": "pickup"})
-    return tasks
+        if pd in day_set and pd <= instance.Days:
+            tasks_by_day[pd].append({"req": req, "type": "pickup"})
+
+    return tasks_by_day
 
 def evaluate_cost(instance, schedule_by_day):
     return evaluate_cost_components(instance, schedule_by_day)["total"]
@@ -70,10 +98,11 @@ def extract_start_days_from_schedule(instance, schedule):
     return None
 
 def calculate_tool_use_from_start_days(instance, start_days):
-    num_tools = len(instance.Tools)
-    daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 1)}
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
+    daily_usage = {day: [0] * num_tools for day in ctx.planning_days}
 
-    for req in instance.Requests:
+    for req in ctx.requests:
         if req.ID not in start_days:
             continue
         start_day = start_days[req.ID]
@@ -90,7 +119,7 @@ def calculate_tool_use_from_start_days(instance, start_days):
 def calculate_validator_tool_use_from_schedule(instance, schedule_by_day):
     # Matches validator/Validate.py: tools used are the maximum shortage in depot inventory
     # implied by route loads and direct customer-to-customer reuse.
-    num_tools = len(instance.Tools)
+    num_tools = get_context(instance).num_tools
     simulated_inventory = [0] * num_tools
     min_inventory = [0] * num_tools
 
@@ -108,16 +137,19 @@ def calculate_validator_tool_use_from_schedule(instance, schedule_by_day):
 
     return [abs(x) for x in min_inventory]
 
-def evaluate_cost_components(instance, schedule_by_day):
-    num_tools = len(instance.Tools)
+def evaluate_cost_components(instance, schedule_by_day, include_customer_tool_use=False):
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
     tool_use = calculate_validator_tool_use_from_schedule(instance, schedule_by_day)
-    start_days = extract_start_days_from_schedule(instance, schedule_by_day)
-    customer_tool_use = (
-        calculate_tool_use_from_start_days(instance, start_days)
-        if start_days is not None
-        else None
-    )
-    tool_cost = sum(tool_use[i] * instance.Tools[i].cost for i in range(num_tools))
+    customer_tool_use = None
+    if include_customer_tool_use:
+        start_days = extract_start_days_from_schedule(instance, schedule_by_day)
+        customer_tool_use = (
+            calculate_tool_use_from_start_days(instance, start_days)
+            if start_days is not None
+            else None
+        )
+    tool_cost = sum(tool_use[i] * ctx.tool_costs[i] for i in range(num_tools))
     
     max_vehicles = max((len(trips) for trips in schedule_by_day.values()), default=0)
     vehicle_days = sum(len(trips) for trips in schedule_by_day.values())
@@ -146,8 +178,9 @@ def evaluate_cost_components(instance, schedule_by_day):
     }
 
 def components_within_tool_limits(instance, components):
+    tool_amounts = get_context(instance).tool_amounts
     return all(
-        used <= instance.Tools[idx].amount
+        used <= tool_amounts[idx]
         for idx, used in enumerate(components["tool_use"])
     )
 
@@ -158,9 +191,11 @@ def schedule_within_tool_limits(instance, schedule_by_day):
     )
 
 def build_trips_from_state(instance, start_days):
-    trips_by_day = {day: [] for day in range(1, instance.Days + 2)}
-    for day in range(1, instance.Days + 2):
-        tasks = get_tasks_for_day(instance, start_days, day)
+    ctx = get_context(instance)
+    tasks_by_day = build_tasks_by_day(instance, start_days)
+    trips_by_day = {day: [] for day in ctx.extended_days}
+    for day in ctx.extended_days:
+        tasks = tasks_by_day.get(day, [])
         trips_by_day[day] = route_day(instance, tasks)
     affected_days = [
         day for day, trips in trips_by_day.items()
@@ -182,7 +217,7 @@ def changed_request_ids(old_state, new_state):
 
 def affected_days_for_requests(instance, old_state, new_state, req_ids):
     affected_days = set()
-    requests_by_id = {req.ID: req for req in instance.Requests}
+    requests_by_id = get_context(instance).requests_by_id
 
     for req_id in req_ids:
         req = requests_by_id[req_id]
@@ -204,9 +239,10 @@ def patch_trips_from_state(instance, current_trips, old_state, new_state):
         return current_trips, set()
 
     affected_days = affected_days_for_requests(instance, old_state, new_state, req_ids)
+    tasks_by_day = build_tasks_by_day(instance, new_state, days=affected_days)
     patched_trips = current_trips.copy()
     for day in affected_days:
-        tasks = get_tasks_for_day(instance, new_state, day)
+        tasks = tasks_by_day.get(day, [])
         patched_trips[day] = route_day(instance, tasks)
 
     patched_trips = improve_affected_days_by_portfolio(
@@ -221,8 +257,10 @@ def patch_trips_from_state(instance, current_trips, old_state, new_state):
 def route_day_greedy(instance, tasks):
     if not tasks: return []
     
-    depot = instance.DepotCoordinate
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    depot = ctx.depot
+    num_tools = ctx.num_tools
+    tool_sizes = ctx.tool_sizes
     trips = []
     unvisited = tasks.copy()
     
@@ -264,14 +302,14 @@ def route_day_greedy(instance, tasks):
                     tools_loaded[tool_idx] = min_inv
                     tools_returned[tool_idx] = -min_inv + current_inv
                     
-                start_cap = sum(-tools_loaded[i] * get_tool_size(instance.Tools[i]) for i in range(num_tools))
+                start_cap = sum(-tools_loaded[i] * tool_sizes[i] for i in range(num_tools))
                 if start_cap > instance.Capacity:
                     continue
                     
                 curr_cap = start_cap
                 max_cap = start_cap
                 for t in temp_route:
-                    t_size = t["req"].toolCount * get_tool_size(instance.Tools[t["req"].tool - 1])
+                    t_size = t["req"].toolCount * tool_sizes[t["req"].tool - 1]
                     if t["type"] == "delivery":
                         curr_cap -= t_size
                     else:
@@ -328,7 +366,7 @@ def route_day_greedy(instance, tasks):
     return trips
 
 def route_to_tasks(instance, route):
-    requests_by_id = {req.ID: req for req in instance.Requests}
+    requests_by_id = get_context(instance).requests_by_id
     tasks = []
     for node_id in route[1:-1]:
         if node_id == 0:
@@ -341,27 +379,37 @@ def route_to_tasks(instance, route):
     return tasks
 
 def route_node_coordinate(instance, node):
+    ctx = get_context(instance)
     if node == 0:
-        return instance.DepotCoordinate
-    return instance.Requests[abs(node) - 1].node
+        return ctx.depot
+    return ctx.requests_by_id[abs(node)].node
 
 def build_trip_from_route(instance, route):
     if len(route) < 3 or route[0] != 0 or route[-1] != 0:
         return None
 
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    requests_by_id = ctx.requests_by_id
+    num_tools = ctx.num_tools
+    depot = ctx.depot
+
+    def node_coordinate(node):
+        if node == 0:
+            return depot
+        return requests_by_id[abs(node)].node
+
     total_dist = 0
     for prev_node, next_node in zip(route, route[1:]):
         if prev_node == 0 and next_node == 0:
             return None
-        from_coord = route_node_coordinate(instance, prev_node)
-        to_coord = route_node_coordinate(instance, next_node)
+        from_coord = node_coordinate(prev_node)
+        to_coord = node_coordinate(next_node)
         total_dist += instance.calcDistance[from_coord][to_coord]
 
     if total_dist > instance.MaxDistance:
         return None
 
-    tool_size = [get_tool_size(tool) for tool in instance.Tools]
+    tool_size = ctx.tool_sizes
     current_tools = [0] * num_tools
     segment_states = []
     visit_loads = [[0] * num_tools]
@@ -393,7 +441,7 @@ def build_trip_from_route(instance, route):
             current_tools = [0] * num_tools
             segment_states = []
         else:
-            req = instance.Requests[abs(node) - 1]
+            req = requests_by_id[abs(node)]
             tool_idx = req.tool - 1
             if node > 0:
                 current_tools[tool_idx] -= req.toolCount
@@ -431,6 +479,17 @@ def build_trip_from_tasks(instance, tasks):
     route_nodes.append(depot)
 
     return build_trip_from_route(instance, route_nodes)
+
+def insertion_distance_delta(instance, route_tasks, task, pos):
+    ctx = get_context(instance)
+    prev_coord = ctx.depot if pos == 0 else route_tasks[pos - 1]["req"].node
+    next_coord = ctx.depot if pos == len(route_tasks) else route_tasks[pos]["req"].node
+    task_coord = task["req"].node
+    return (
+        instance.calcDistance[prev_coord][task_coord] +
+        instance.calcDistance[task_coord][next_coord] -
+        instance.calcDistance[prev_coord][next_coord]
+    )
 
 def task_cache_key(tasks):
     return tuple(
@@ -474,6 +533,7 @@ def route_day_insertion(instance, tasks):
     if not tasks:
         return []
 
+    single_trip_cache = {}
     unrouted = sorted(
         tasks,
         key=lambda task: instance.calcDistance[instance.DepotCoordinate][task["req"].node],
@@ -484,9 +544,16 @@ def route_day_insertion(instance, tasks):
     while unrouted:
         best_move = None
         best_score = None
+        route_stats = [
+            build_trip_from_tasks(instance, route_tasks)
+            for route_tasks in route_task_lists
+        ]
 
         for task in unrouted:
-            single_trip = build_trip_from_tasks(instance, [task])
+            single_key = task_cache_key([task])
+            if single_key not in single_trip_cache:
+                single_trip_cache[single_key] = build_trip_from_tasks(instance, [task])
+            single_trip = single_trip_cache[single_key]
             if single_trip is None:
                 continue
 
@@ -495,14 +562,18 @@ def route_day_insertion(instance, tasks):
                 break
 
             for route_idx, route_tasks in enumerate(route_task_lists):
-                old_trip = build_trip_from_tasks(instance, route_tasks)
+                old_trip = route_stats[route_idx]
+                if old_trip is None:
+                    continue
                 old_distance = old_trip["distance"] if old_trip else 0
                 for pos in range(len(route_tasks) + 1):
+                    distance_increase = insertion_distance_delta(instance, route_tasks, task, pos)
+                    if old_distance + distance_increase > instance.MaxDistance:
+                        continue
                     candidate_tasks = route_tasks[:pos] + [task] + route_tasks[pos:]
                     candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
                     if candidate_trip is None:
                         continue
-                    distance_increase = candidate_trip["distance"] - old_distance
                     score = distance_increase * instance.DistanceCost
                     if best_score is None or score < best_score:
                         best_score = score
@@ -569,10 +640,13 @@ def insertion_option_score(instance, old_trip, old_bonus, candidate_trip, candid
         0.35 * tool_load_delta
     )
 
-def best_regret_options_for_task(instance, route_task_lists, route_stats, task):
+def best_regret_options_for_task(instance, route_task_lists, route_stats, task, single_trip_cache):
     options = []
 
-    single_trip = build_trip_from_tasks(instance, [task])
+    single_key = task_cache_key([task])
+    if single_key not in single_trip_cache:
+        single_trip_cache[single_key] = build_trip_from_tasks(instance, [task])
+    single_trip = single_trip_cache[single_key]
     if single_trip is not None:
         score = insertion_option_score(
             instance,
@@ -586,7 +660,12 @@ def best_regret_options_for_task(instance, route_task_lists, route_stats, task):
 
     for route_idx, route_tasks in enumerate(route_task_lists):
         old_trip, old_bonus = route_stats[route_idx]
+        if old_trip is None:
+            continue
         for pos in range(len(route_tasks) + 1):
+            distance_delta = insertion_distance_delta(instance, route_tasks, task, pos)
+            if old_trip["distance"] + distance_delta > instance.MaxDistance:
+                continue
             candidate_tasks = route_tasks[:pos] + [task] + route_tasks[pos:]
             candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
             if candidate_trip is None:
@@ -617,6 +696,7 @@ def route_day_regret(instance, tasks, regret_k=2):
         ),
     )
     route_task_lists = []
+    single_trip_cache = {}
 
     while unrouted:
         route_stats = [
@@ -627,7 +707,13 @@ def route_day_regret(instance, tasks, regret_k=2):
         best_priority = None
 
         for task in unrouted:
-            options = best_regret_options_for_task(instance, route_task_lists, route_stats, task)
+            options = best_regret_options_for_task(
+                instance,
+                route_task_lists,
+                route_stats,
+                task,
+                single_trip_cache,
+            )
             if not options:
                 continue
 
@@ -810,8 +896,9 @@ def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, af
     if not components_within_tool_limits(instance, best_components):
         return improved_schedule
 
+    tasks_by_day = build_tasks_by_day(instance, start_days, days=affected_days)
     for day in sorted(affected_days):
-        tasks = get_tasks_for_day(instance, start_days, day)
+        tasks = tasks_by_day.get(day, [])
         best_trips_for_day = improved_schedule.get(day, [])
         best_cost = best_components["total"]
 
@@ -969,11 +1056,12 @@ def tool_peak_cost_from_usage(instance, daily_usage):
     return total
 
 def generate_tool_balanced_start_days(instance):
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
     start_days = {}
     daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
     ordered_requests = sorted(
-        instance.Requests,
+        ctx.requests,
         key=lambda req: (
             -req.toolCount * instance.Tools[req.tool - 1].cost * req.numDays,
             req.toDay - req.fromDay,
@@ -1015,12 +1103,13 @@ def generate_tool_balanced_start_days(instance):
     return start_days
 
 def generate_vehicle_day_clustered_start_days(instance):
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
     start_days = {}
     daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
     task_counts = {day: 0 for day in range(1, instance.Days + 2)}
     ordered_requests = sorted(
-        instance.Requests,
+        ctx.requests,
         key=lambda req: (req.toDay - req.fromDay, -req.toolCount),
     )
 
@@ -1064,12 +1153,13 @@ def generate_vehicle_day_clustered_start_days(instance):
     return start_days
 
 def generate_distance_clustered_start_days(instance):
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
     start_days = {}
     daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
     task_node_by_day = {day: [] for day in range(1, instance.Days + 2)}
     ordered_requests = sorted(
-        instance.Requests,
+        ctx.requests,
         key=lambda req: instance.calcDistance[instance.DepotCoordinate][req.node],
         reverse=True,
     )
@@ -1154,18 +1244,20 @@ def generate_initial_solution(instance):
     return {req.ID: req.fromDay for req in instance.Requests}
 
 def calculate_daily_tool_usage(instance, start_days):
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
     daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
-    for req in instance.Requests:
+    for req in ctx.requests:
         start_day = start_days[req.ID]
         for day in active_tool_days(instance, req, start_day):
             daily_usage[day][req.tool - 1] += req.toolCount
     return daily_usage
 
 def calculate_partial_daily_tool_usage(instance, partial_state):
-    num_tools = len(instance.Tools)
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
     daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
-    for req in instance.Requests:
+    for req in ctx.requests:
         if req.ID not in partial_state:
             continue
         start_day = partial_state[req.ID]
@@ -1183,7 +1275,7 @@ def is_partial_schedule_feasible(instance, partial_state):
 
 def get_partial_tasks_for_day(instance, partial_state, day):
     tasks = []
-    for req in instance.Requests:
+    for req in get_context(instance).requests:
         if req.ID not in partial_state:
             continue
         start_day = partial_state[req.ID]
