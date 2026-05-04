@@ -137,28 +137,69 @@ def calculate_validator_tool_use_from_schedule(instance, schedule_by_day):
 
     return [abs(x) for x in min_inventory]
 
-def evaluate_cost_components(instance, schedule_by_day, include_customer_tool_use=False):
+def summarize_day_components(instance, trips):
     ctx = get_context(instance)
-    num_tools = ctx.num_tools
-    tool_use = calculate_validator_tool_use_from_schedule(instance, schedule_by_day)
-    customer_tool_use = None
-    if include_customer_tool_use:
-        start_days = extract_start_days_from_schedule(instance, schedule_by_day)
-        customer_tool_use = (
-            calculate_tool_use_from_start_days(instance, start_days)
-            if start_days is not None
-            else None
-        )
-    tool_cost = sum(tool_use[i] * ctx.tool_costs[i] for i in range(num_tools))
-    
-    max_vehicles = max((len(trips) for trips in schedule_by_day.values()), default=0)
-    vehicle_days = sum(len(trips) for trips in schedule_by_day.values())
-    total_distance = sum(trip["distance"] for trips in schedule_by_day.values() for trip in trips)
-    
+    loaded = [0] * ctx.num_tools
+    returned = [0] * ctx.num_tools
+    distance = 0
+
+    for trip in trips:
+        distance += trip["distance"]
+        for idx in range(ctx.num_tools):
+            loaded[idx] += trip["tools_loaded"][idx]
+            returned[idx] += trip["tools_returned"][idx]
+
+    return {
+        "route_count": len(trips),
+        "distance": distance,
+        "loaded": loaded,
+        "returned": returned,
+    }
+
+def calculate_validator_tool_use_from_daily_summaries(instance, daily_loaded, daily_returned):
+    ctx = get_context(instance)
+    inventory = [0] * ctx.num_tools
+    min_inventory = [0] * ctx.num_tools
+    inventory_after_day = {}
+    min_after_day = {}
+
+    for day in ctx.extended_days:
+        loaded = daily_loaded.get(day, [0] * ctx.num_tools)
+        returned = daily_returned.get(day, [0] * ctx.num_tools)
+        for idx in range(ctx.num_tools):
+            inventory[idx] += loaded[idx]
+        for idx in range(ctx.num_tools):
+            if inventory[idx] < min_inventory[idx]:
+                min_inventory[idx] = inventory[idx]
+        for idx in range(ctx.num_tools):
+            inventory[idx] += returned[idx]
+
+        inventory_after_day[day] = list(inventory)
+        min_after_day[day] = list(min_inventory)
+
+    return [abs(value) for value in min_inventory], inventory_after_day, min_after_day
+
+def build_component_result(
+    instance,
+    tool_use,
+    max_vehicles,
+    vehicle_days,
+    total_distance,
+    customer_tool_use=None,
+    daily_route_count=None,
+    daily_distance=None,
+    daily_loaded=None,
+    daily_returned=None,
+    inventory_after_day=None,
+    min_after_day=None,
+):
+    ctx = get_context(instance)
+    tool_cost = sum(tool_use[i] * ctx.tool_costs[i] for i in range(ctx.num_tools))
+
     veh_cost = getattr(instance, 'VehicleCost', 100000)
     veh_day_cost = getattr(instance, 'VehicleDayCost', 10000)
     dist_cost = getattr(instance, 'DistanceCost', 1)
-    
+
     fixed_vehicle_cost = max_vehicles * veh_cost
     vehicle_day_cost = vehicle_days * veh_day_cost
     distance_cost = total_distance * dist_cost
@@ -175,7 +216,143 @@ def evaluate_cost_components(instance, schedule_by_day, include_customer_tool_us
         "total_distance": total_distance,
         "tool_use": tool_use,
         "customer_tool_use": customer_tool_use,
+        "_daily_route_count": daily_route_count,
+        "_daily_distance": daily_distance,
+        "_daily_loaded": daily_loaded,
+        "_daily_returned": daily_returned,
+        "_inventory_after_day": inventory_after_day,
+        "_min_after_day": min_after_day,
     }
+
+def evaluate_cost_components(instance, schedule_by_day, include_customer_tool_use=False):
+    ctx = get_context(instance)
+    daily_route_count = {}
+    daily_distance = {}
+    daily_loaded = {}
+    daily_returned = {}
+
+    for day in ctx.extended_days:
+        summary = summarize_day_components(instance, schedule_by_day.get(day, []))
+        daily_route_count[day] = summary["route_count"]
+        daily_distance[day] = summary["distance"]
+        daily_loaded[day] = summary["loaded"]
+        daily_returned[day] = summary["returned"]
+
+    tool_use, inventory_after_day, min_after_day = calculate_validator_tool_use_from_daily_summaries(
+        instance,
+        daily_loaded,
+        daily_returned,
+    )
+    customer_tool_use = None
+    if include_customer_tool_use:
+        start_days = extract_start_days_from_schedule(instance, schedule_by_day)
+        customer_tool_use = (
+            calculate_tool_use_from_start_days(instance, start_days)
+            if start_days is not None
+            else None
+        )
+
+    return build_component_result(
+        instance,
+        tool_use,
+        max(daily_route_count.values(), default=0),
+        sum(daily_route_count.values()),
+        sum(daily_distance.values()),
+        customer_tool_use=customer_tool_use,
+        daily_route_count=daily_route_count,
+        daily_distance=daily_distance,
+        daily_loaded=daily_loaded,
+        daily_returned=daily_returned,
+        inventory_after_day=inventory_after_day,
+        min_after_day=min_after_day,
+    )
+
+def evaluate_delta_cost_components(instance, old_components, new_schedule_by_day, affected_days):
+    ctx = get_context(instance)
+    affected_days = sorted(day for day in affected_days if day in ctx.extended_days)
+    required_keys = (
+        "_daily_route_count",
+        "_daily_distance",
+        "_daily_loaded",
+        "_daily_returned",
+        "_inventory_after_day",
+        "_min_after_day",
+    )
+    if not affected_days or any(old_components.get(key) is None for key in required_keys):
+        return evaluate_cost_components(instance, new_schedule_by_day)
+
+    daily_route_count = dict(old_components["_daily_route_count"])
+    daily_distance = dict(old_components["_daily_distance"])
+    daily_loaded = {
+        day: list(values)
+        for day, values in old_components["_daily_loaded"].items()
+    }
+    daily_returned = {
+        day: list(values)
+        for day, values in old_components["_daily_returned"].items()
+    }
+
+    vehicle_days = old_components["vehicle_day_count"]
+    total_distance = old_components["total_distance"]
+
+    for day in affected_days:
+        old_route_count = daily_route_count.get(day, 0)
+        old_distance = daily_distance.get(day, 0)
+        summary = summarize_day_components(instance, new_schedule_by_day.get(day, []))
+        daily_route_count[day] = summary["route_count"]
+        daily_distance[day] = summary["distance"]
+        daily_loaded[day] = summary["loaded"]
+        daily_returned[day] = summary["returned"]
+        vehicle_days += summary["route_count"] - old_route_count
+        total_distance += summary["distance"] - old_distance
+
+    inventory_after_day = {
+        day: list(values)
+        for day, values in old_components["_inventory_after_day"].items()
+    }
+    min_after_day = {
+        day: list(values)
+        for day, values in old_components["_min_after_day"].items()
+    }
+
+    start_day = affected_days[0]
+    previous_day = start_day - 1
+    if previous_day in inventory_after_day:
+        inventory = list(inventory_after_day[previous_day])
+        min_inventory = list(min_after_day[previous_day])
+    else:
+        inventory = [0] * ctx.num_tools
+        min_inventory = [0] * ctx.num_tools
+
+    for day in range(start_day, ctx.extended_days[-1] + 1):
+        loaded = daily_loaded.get(day, [0] * ctx.num_tools)
+        returned = daily_returned.get(day, [0] * ctx.num_tools)
+        for idx in range(ctx.num_tools):
+            inventory[idx] += loaded[idx]
+        for idx in range(ctx.num_tools):
+            if inventory[idx] < min_inventory[idx]:
+                min_inventory[idx] = inventory[idx]
+        for idx in range(ctx.num_tools):
+            inventory[idx] += returned[idx]
+        inventory_after_day[day] = list(inventory)
+        min_after_day[day] = list(min_inventory)
+
+    tool_use = [abs(value) for value in min_inventory]
+
+    return build_component_result(
+        instance,
+        tool_use,
+        max(daily_route_count.values(), default=0),
+        vehicle_days,
+        total_distance,
+        customer_tool_use=None,
+        daily_route_count=daily_route_count,
+        daily_distance=daily_distance,
+        daily_loaded=daily_loaded,
+        daily_returned=daily_returned,
+        inventory_after_day=inventory_after_day,
+        min_after_day=min_after_day,
+    )
 
 def components_within_tool_limits(instance, components):
     tool_amounts = get_context(instance).tool_amounts
@@ -497,6 +674,84 @@ def task_cache_key(tasks):
         for task in tasks
     )
 
+class DailyRouteEvaluator:
+    def __init__(self, instance):
+        self.instance = instance
+        self.trip_cache = {}
+        self.reuse_bonus_cache = {}
+        self.route_task_cache = {}
+        self.tool_load_cache = {}
+
+    def trip(self, tasks):
+        key = task_cache_key(tasks)
+        if key not in self.trip_cache:
+            self.trip_cache[key] = build_trip_from_tasks(self.instance, tasks)
+        return self.trip_cache[key]
+
+    def route_tasks(self, trip):
+        key = tuple(trip["route"])
+        if key not in self.route_task_cache:
+            self.route_task_cache[key] = route_to_tasks(self.instance, trip["route"])
+        return self.route_task_cache[key]
+
+    def reuse_bonus(self, route_tasks):
+        key = task_cache_key(route_tasks)
+        if key in self.reuse_bonus_cache:
+            return self.reuse_bonus_cache[key]
+
+        available_by_tool = {}
+        bonus = 0
+        tools = self.instance.Tools
+
+        for task in route_tasks:
+            tool_idx = task["req"].tool - 1
+            amount = task["req"].toolCount
+            if task["type"] == "pickup":
+                available_by_tool[tool_idx] = available_by_tool.get(tool_idx, 0) + amount
+            else:
+                reused = min(available_by_tool.get(tool_idx, 0), amount)
+                if reused > 0:
+                    bonus += reused * tools[tool_idx].cost
+                    available_by_tool[tool_idx] -= reused
+
+        self.reuse_bonus_cache[key] = bonus
+        return bonus
+
+    def tool_load_cost(self, trip):
+        if trip is None:
+            return 0
+        key = tuple(trip["route"])
+        if key not in self.tool_load_cache:
+            self.tool_load_cache[key] = sum(
+                max(0, -amount) * self.instance.Tools[idx].cost
+                for idx, amount in enumerate(trip["tools_loaded"])
+            )
+        return self.tool_load_cache[key]
+
+    def local_score(self, trip):
+        route_tasks = self.route_tasks(trip)
+        return (
+            trip["distance"] * self.instance.DistanceCost
+            + 0.35 * self.tool_load_cost(trip)
+            - 0.05 * self.reuse_bonus(route_tasks)
+        )
+
+    def insertion_option_score(self, old_trip, old_bonus, candidate_trip, candidate_tasks, creates_route):
+        old_distance = old_trip["distance"] if old_trip is not None else 0
+        distance_delta = candidate_trip["distance"] - old_distance
+        reuse_delta = self.reuse_bonus(candidate_tasks) - old_bonus
+        tool_load_delta = self.tool_load_cost(candidate_trip) - self.tool_load_cost(old_trip)
+        route_penalty = 0
+        if creates_route:
+            route_penalty = self.instance.VehicleDayCost + 0.05 * self.instance.VehicleCost
+
+        return (
+            distance_delta * self.instance.DistanceCost +
+            route_penalty -
+            0.05 * reuse_delta +
+            0.35 * tool_load_delta
+        )
+
 def clone_trip(trip):
     cloned = {
         "route": list(trip["route"]),
@@ -533,7 +788,7 @@ def route_day_insertion(instance, tasks):
     if not tasks:
         return []
 
-    single_trip_cache = {}
+    evaluator = DailyRouteEvaluator(instance)
     unrouted = sorted(
         tasks,
         key=lambda task: instance.calcDistance[instance.DepotCoordinate][task["req"].node],
@@ -545,15 +800,12 @@ def route_day_insertion(instance, tasks):
         best_move = None
         best_score = None
         route_stats = [
-            build_trip_from_tasks(instance, route_tasks)
+            evaluator.trip(route_tasks)
             for route_tasks in route_task_lists
         ]
 
         for task in unrouted:
-            single_key = task_cache_key([task])
-            if single_key not in single_trip_cache:
-                single_trip_cache[single_key] = build_trip_from_tasks(instance, [task])
-            single_trip = single_trip_cache[single_key]
+            single_trip = evaluator.trip([task])
             if single_trip is None:
                 continue
 
@@ -571,7 +823,7 @@ def route_day_insertion(instance, tasks):
                     if old_distance + distance_increase > instance.MaxDistance:
                         continue
                     candidate_tasks = route_tasks[:pos] + [task] + route_tasks[pos:]
-                    candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+                    candidate_trip = evaluator.trip(candidate_tasks)
                     if candidate_trip is None:
                         continue
                     score = distance_increase * instance.DistanceCost
@@ -596,60 +848,33 @@ def route_day_insertion(instance, tasks):
             )
 
     return [
-        build_trip_from_tasks(instance, route_tasks)
+        trip
         for route_tasks in route_task_lists
+        for trip in [evaluator.trip(route_tasks)]
+        if trip is not None
     ]
 
 def route_reuse_bonus(instance, route_tasks):
-    available_by_tool = {}
-    bonus = 0
-
-    for task in route_tasks:
-        tool_idx = task["req"].tool - 1
-        amount = task["req"].toolCount
-        if task["type"] == "pickup":
-            available_by_tool[tool_idx] = available_by_tool.get(tool_idx, 0) + amount
-        else:
-            reused = min(available_by_tool.get(tool_idx, 0), amount)
-            if reused > 0:
-                bonus += reused * instance.Tools[tool_idx].cost
-                available_by_tool[tool_idx] -= reused
-
-    return bonus
+    return DailyRouteEvaluator(instance).reuse_bonus(route_tasks)
 
 def trip_tool_load_cost(instance, trip):
-    return sum(
-        max(0, -amount) * instance.Tools[idx].cost
-        for idx, amount in enumerate(trip["tools_loaded"])
-    )
+    return DailyRouteEvaluator(instance).tool_load_cost(trip)
 
 def insertion_option_score(instance, old_trip, old_bonus, candidate_trip, candidate_tasks, creates_route):
-    old_distance = old_trip["distance"] if old_trip is not None else 0
-    distance_delta = candidate_trip["distance"] - old_distance
-    reuse_delta = route_reuse_bonus(instance, candidate_tasks) - old_bonus
-    old_tool_load = trip_tool_load_cost(instance, old_trip) if old_trip is not None else 0
-    tool_load_delta = trip_tool_load_cost(instance, candidate_trip) - old_tool_load
-    route_penalty = 0
-    if creates_route:
-        route_penalty = instance.VehicleDayCost + 0.05 * instance.VehicleCost
-
-    return (
-        distance_delta * instance.DistanceCost +
-        route_penalty -
-        0.05 * reuse_delta +
-        0.35 * tool_load_delta
+    return DailyRouteEvaluator(instance).insertion_option_score(
+        old_trip,
+        old_bonus,
+        candidate_trip,
+        candidate_tasks,
+        creates_route,
     )
 
-def best_regret_options_for_task(instance, route_task_lists, route_stats, task, single_trip_cache):
+def best_regret_options_for_task(instance, route_task_lists, route_stats, task, evaluator):
     options = []
 
-    single_key = task_cache_key([task])
-    if single_key not in single_trip_cache:
-        single_trip_cache[single_key] = build_trip_from_tasks(instance, [task])
-    single_trip = single_trip_cache[single_key]
+    single_trip = evaluator.trip([task])
     if single_trip is not None:
-        score = insertion_option_score(
-            instance,
+        score = evaluator.insertion_option_score(
             None,
             0,
             single_trip,
@@ -667,12 +892,11 @@ def best_regret_options_for_task(instance, route_task_lists, route_stats, task, 
             if old_trip["distance"] + distance_delta > instance.MaxDistance:
                 continue
             candidate_tasks = route_tasks[:pos] + [task] + route_tasks[pos:]
-            candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+            candidate_trip = evaluator.trip(candidate_tasks)
             if candidate_trip is None:
                 continue
 
-            score = insertion_option_score(
-                instance,
+            score = evaluator.insertion_option_score(
                 old_trip,
                 old_bonus,
                 candidate_trip,
@@ -696,11 +920,11 @@ def route_day_regret(instance, tasks, regret_k=2):
         ),
     )
     route_task_lists = []
-    single_trip_cache = {}
+    evaluator = DailyRouteEvaluator(instance)
 
     while unrouted:
         route_stats = [
-            (build_trip_from_tasks(instance, route_tasks), route_reuse_bonus(instance, route_tasks))
+            (evaluator.trip(route_tasks), evaluator.reuse_bonus(route_tasks))
             for route_tasks in route_task_lists
         ]
         best_choice = None
@@ -712,7 +936,7 @@ def route_day_regret(instance, tasks, regret_k=2):
                 route_task_lists,
                 route_stats,
                 task,
-                single_trip_cache,
+                evaluator,
             )
             if not options:
                 continue
@@ -747,26 +971,24 @@ def route_day_regret(instance, tasks, regret_k=2):
             route_task_lists[route_idx] = candidate_tasks
 
     return [
-        build_trip_from_tasks(instance, route_tasks)
+        trip
         for route_tasks in route_task_lists
+        for trip in [evaluator.trip(route_tasks)]
+        if trip is not None
     ]
 
 def trip_local_score(instance, trip):
-    tasks = route_to_tasks(instance, trip["route"])
-    return (
-        trip["distance"] * instance.DistanceCost
-        + 0.35 * trip_tool_load_cost(instance, trip)
-        - 0.05 * route_reuse_bonus(instance, tasks)
-    )
+    return DailyRouteEvaluator(instance).local_score(trip)
 
-def improve_trip_sequence(instance, trip, max_passes=2):
-    tasks = route_to_tasks(instance, trip["route"])
+def improve_trip_sequence(instance, trip, max_passes=2, evaluator=None):
+    evaluator = evaluator or DailyRouteEvaluator(instance)
+    tasks = evaluator.route_tasks(trip)
     if len(tasks) < 2:
         return trip
 
     best_trip = trip
     best_tasks = tasks
-    best_score = trip_local_score(instance, trip)
+    best_score = evaluator.local_score(trip)
 
     for _ in range(max_passes):
         improved = False
@@ -775,10 +997,10 @@ def improve_trip_sequence(instance, trip, max_passes=2):
             for j in range(i + 1, len(best_tasks)):
                 candidate_tasks = best_tasks.copy()
                 candidate_tasks[i], candidate_tasks[j] = candidate_tasks[j], candidate_tasks[i]
-                candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+                candidate_trip = evaluator.trip(candidate_tasks)
                 if candidate_trip is None:
                     continue
-                candidate_score = trip_local_score(instance, candidate_trip)
+                candidate_score = evaluator.local_score(candidate_trip)
                 if candidate_score < best_score:
                     best_trip = candidate_trip
                     best_tasks = candidate_tasks
@@ -792,10 +1014,10 @@ def improve_trip_sequence(instance, trip, max_passes=2):
                 if pos == i:
                     continue
                 candidate_tasks = remaining[:pos] + [task] + remaining[pos:]
-                candidate_trip = build_trip_from_tasks(instance, candidate_tasks)
+                candidate_trip = evaluator.trip(candidate_tasks)
                 if candidate_trip is None:
                     continue
-                candidate_score = trip_local_score(instance, candidate_trip)
+                candidate_score = evaluator.local_score(candidate_trip)
                 if candidate_score < best_score:
                     best_trip = candidate_trip
                     best_tasks = candidate_tasks
@@ -807,12 +1029,13 @@ def improve_trip_sequence(instance, trip, max_passes=2):
 
     return best_trip
 
-def day_route_score(instance, trips):
+def day_route_score(instance, trips, evaluator=None):
+    evaluator = evaluator or DailyRouteEvaluator(instance)
     distance_cost = sum(trip["distance"] for trip in trips) * instance.DistanceCost
     route_cost = len(trips) * (instance.VehicleDayCost + 0.05 * instance.VehicleCost)
-    tool_load_cost = sum(trip_tool_load_cost(instance, trip) for trip in trips)
+    tool_load_cost = sum(evaluator.tool_load_cost(trip) for trip in trips)
     reuse_bonus = sum(
-        route_reuse_bonus(instance, route_to_tasks(instance, trip["route"]))
+        evaluator.reuse_bonus(evaluator.route_tasks(trip))
         for trip in trips
     )
     return route_cost + distance_cost + 0.35 * tool_load_cost - 0.05 * reuse_bonus
@@ -821,25 +1044,26 @@ def improve_day_routes(instance, trips):
     if not trips:
         return []
 
-    original_score = day_route_score(instance, trips)
-    improved_trips = [improve_trip_sequence(instance, trip) for trip in trips]
+    evaluator = DailyRouteEvaluator(instance)
+    original_score = day_route_score(instance, trips, evaluator)
+    improved_trips = [improve_trip_sequence(instance, trip, evaluator=evaluator) for trip in trips]
 
     improved = True
     while improved:
         improved = False
         best_move = None
-        best_score = day_route_score(instance, improved_trips)
+        best_score = day_route_score(instance, improved_trips, evaluator)
 
         for i in range(len(improved_trips)):
             for j in range(i + 1, len(improved_trips)):
-                merged_trip = try_merge_trips(instance, improved_trips[i], improved_trips[j])
+                merged_trip = try_merge_trips(instance, improved_trips[i], improved_trips[j], evaluator=evaluator)
                 if merged_trip is None:
                     continue
                 candidate_trips = [
                     trip for idx, trip in enumerate(improved_trips)
                     if idx not in (i, j)
-                ] + [improve_trip_sequence(instance, merged_trip)]
-                candidate_score = day_route_score(instance, candidate_trips)
+                ] + [improve_trip_sequence(instance, merged_trip, evaluator=evaluator)]
+                candidate_score = day_route_score(instance, candidate_trips, evaluator)
                 if candidate_score < best_score:
                     best_score = candidate_score
                     best_move = candidate_trips
@@ -848,7 +1072,7 @@ def improve_day_routes(instance, trips):
             improved_trips = best_move
             improved = True
 
-    if day_route_score(instance, improved_trips) < original_score:
+    if day_route_score(instance, improved_trips, evaluator) < original_score:
         return improved_trips
     return trips
 
@@ -907,7 +1131,12 @@ def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, af
                 continue
             candidate_schedule = improved_schedule.copy()
             candidate_schedule[day] = candidate_trips
-            candidate_components = evaluate_cost_components(instance, candidate_schedule)
+            candidate_components = evaluate_delta_cost_components(
+                instance,
+                best_components,
+                candidate_schedule,
+                {day},
+            )
             if not components_within_tool_limits(instance, candidate_components):
                 continue
             if candidate_components["total"] < best_cost:
@@ -931,14 +1160,15 @@ def route_distance(instance, tasks):
     total_dist += instance.calcDistance[curr_node][depot]
     return total_dist
 
-def greedy_insert_tasks(instance, base_tasks, inserted_tasks):
+def greedy_insert_tasks(instance, base_tasks, inserted_tasks, evaluator=None):
+    evaluator = evaluator or DailyRouteEvaluator(instance)
     merged = base_tasks.copy()
     for task in inserted_tasks:
         best_sequence = None
         best_distance = float('inf')
         for pos in range(len(merged) + 1):
             candidate = merged[:pos] + [task] + merged[pos:]
-            trip = build_trip_from_tasks(instance, candidate)
+            trip = evaluator.trip(candidate)
             if trip is None:
                 continue
             if trip["distance"] < best_distance:
@@ -947,11 +1177,12 @@ def greedy_insert_tasks(instance, base_tasks, inserted_tasks):
         if best_sequence is None:
             return None
         merged = best_sequence
-    return build_trip_from_tasks(instance, merged)
+    return evaluator.trip(merged)
 
-def try_merge_trips(instance, trip_a, trip_b):
-    tasks_a = route_to_tasks(instance, trip_a["route"])
-    tasks_b = route_to_tasks(instance, trip_b["route"])
+def try_merge_trips(instance, trip_a, trip_b, evaluator=None):
+    evaluator = evaluator or DailyRouteEvaluator(instance)
+    tasks_a = evaluator.route_tasks(trip_a)
+    tasks_b = evaluator.route_tasks(trip_b)
     candidates = []
 
     for route in (
@@ -963,7 +1194,7 @@ def try_merge_trips(instance, trip_a, trip_b):
             candidates.append(trip)
 
     for task_sequence in (tasks_a + tasks_b, tasks_b + tasks_a):
-        trip = build_trip_from_tasks(instance, task_sequence)
+        trip = evaluator.trip(task_sequence)
         if trip is not None:
             candidates.append(trip)
 
@@ -974,7 +1205,7 @@ def try_merge_trips(instance, trip_a, trip_b):
         (tasks_b, list(reversed(tasks_a))),
     ]
     for base_tasks, inserted_tasks in insertion_candidates:
-        trip = greedy_insert_tasks(instance, base_tasks, inserted_tasks)
+        trip = greedy_insert_tasks(instance, base_tasks, inserted_tasks, evaluator=evaluator)
         if trip is not None:
             candidates.append(trip)
 
@@ -987,7 +1218,8 @@ def merge_routes_postprocess(instance, schedule_by_day):
         day: [trip.copy() for trip in trips]
         for day, trips in schedule_by_day.items()
     }
-    current_cost = evaluate_cost(instance, improved_schedule)
+    current_components = evaluate_cost_components(instance, improved_schedule)
+    current_cost = current_components["total"]
     merges_applied = 0
 
     improved = True
@@ -1015,14 +1247,20 @@ def merge_routes_postprocess(instance, schedule_by_day):
                     ]
                     candidate_trips.append(merged_trip)
                     candidate_schedule[day] = candidate_trips
-                    candidate_cost = evaluate_cost(instance, candidate_schedule)
+                    candidate_components = evaluate_delta_cost_components(
+                        instance,
+                        current_components,
+                        candidate_schedule,
+                        {day},
+                    )
+                    candidate_cost = candidate_components["total"]
 
                     if candidate_cost < best_cost:
                         best_cost = candidate_cost
-                        best_move = (day, i, j, merged_trip)
+                        best_move = (day, i, j, merged_trip, candidate_components)
 
         if best_move is not None:
-            day, i, j, merged_trip = best_move
+            day, i, j, merged_trip, current_components = best_move
             trips = improved_schedule[day]
             improved_schedule[day] = [
                 trip for idx, trip in enumerate(trips)
@@ -1541,18 +1779,23 @@ def propose_best_tool_move(instance, current_state, req, current_trips=None, cur
             continue
 
         if current_trips is not None and current_components is not None:
-            candidate_trips, _ = patch_trips_from_state(
+            candidate_trips, affected_days = patch_trips_from_state(
                 instance,
                 current_trips,
                 current_state,
                 candidate_state,
             )
-            candidate_components = evaluate_cost_components(instance, candidate_trips)
+            candidate_components = evaluate_delta_cost_components(
+                instance,
+                current_components,
+                candidate_trips,
+                affected_days,
+            )
             if not components_within_tool_limits(instance, candidate_components):
                 continue
-            score, _ = score_completed_schedule(
+            score, _ = score_components(
                 instance,
-                candidate_trips,
+                candidate_components,
                 "tools",
                 current_components,
             )
@@ -1675,9 +1918,7 @@ def choose_destroy_requests(instance, current_state, current_trips, components, 
 
     return unique[:destroy_size]
 
-def score_completed_schedule(instance, schedule, dominant_part, reference_components=None):
-    components = evaluate_cost_components(instance, schedule)
-
+def score_components(instance, components, dominant_part, reference_components=None):
     if reference_components is None:
         return components["total"], components
 
@@ -1703,6 +1944,10 @@ def score_completed_schedule(instance, schedule, dominant_part, reference_compon
         return components["total"] + fixed_vehicle_regression, components
 
     return components["total"], components
+
+def score_completed_schedule(instance, schedule, dominant_part, reference_components=None):
+    components = evaluate_cost_components(instance, schedule)
+    return score_components(instance, components, dominant_part, reference_components)
 
 def partial_repair_score(instance, partial_state, dominant_part, exact_days=None):
     daily_usage = calculate_partial_daily_tool_usage(instance, partial_state)
@@ -1831,19 +2076,24 @@ def exact_request_insertions(
         if not is_schedule_feasible(instance, candidate_state):
             continue
 
-        candidate_trips, _ = patch_trips_from_state(
+        candidate_trips, affected_days = patch_trips_from_state(
             instance,
             current_trips,
             current_state,
             candidate_state,
         )
-        candidate_components = evaluate_cost_components(instance, candidate_trips)
+        candidate_components = evaluate_delta_cost_components(
+            instance,
+            reference_components,
+            candidate_trips,
+            affected_days,
+        )
         if not components_within_tool_limits(instance, candidate_components):
             continue
 
-        score, candidate_components = score_completed_schedule(
+        score, candidate_components = score_components(
             instance,
-            candidate_trips,
+            candidate_components,
             dominant_part,
             reference_components,
         )
@@ -2088,15 +2338,20 @@ def run_alns(instance, initial_state, initial_trips=None, iterations=250, destro
             temperature *= cooling_rate
             continue
 
-        new_trips, _ = patch_trips_from_state(instance, current_trips, current_state, new_state)
-        new_components = evaluate_cost_components(instance, new_trips)
+        new_trips, affected_days = patch_trips_from_state(instance, current_trips, current_state, new_state)
+        new_components = evaluate_delta_cost_components(
+            instance,
+            current_components,
+            new_trips,
+            affected_days,
+        )
         if not components_within_tool_limits(instance, new_components):
             temperature *= cooling_rate
             continue
         new_cost = new_components["total"]
-        new_score, new_components = score_completed_schedule(
+        new_score, new_components = score_components(
             instance,
-            new_trips,
+            new_components,
             initial_dominant_part,
             current_components,
         )
@@ -2151,8 +2406,13 @@ def estimate_initial_temperature(instance, current_state, current_trips, current
         if new_state is None or not is_schedule_feasible(instance, new_state):
             continue
 
-        new_trips, _ = patch_trips_from_state(instance, current_trips, current_state, new_state)
-        new_components = evaluate_cost_components(instance, new_trips)
+        new_trips, affected_days = patch_trips_from_state(instance, current_trips, current_state, new_state)
+        new_components = evaluate_delta_cost_components(
+            instance,
+            current_components,
+            new_trips,
+            affected_days,
+        )
         if not components_within_tool_limits(instance, new_components):
             continue
 
@@ -2215,8 +2475,13 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
             if not is_schedule_feasible(instance, new_state):
                 continue
 
-            new_trips, _ = patch_trips_from_state(instance, current_trips, current_state, new_state)
-            new_components = evaluate_cost_components(instance, new_trips)
+            new_trips, affected_days = patch_trips_from_state(instance, current_trips, current_state, new_state)
+            new_components = evaluate_delta_cost_components(
+                instance,
+                current_components,
+                new_trips,
+                affected_days,
+            )
             if not components_within_tool_limits(instance, new_components):
                 continue
             new_cost = new_components["total"]
