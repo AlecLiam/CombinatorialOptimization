@@ -31,7 +31,7 @@ def get_existing_cost(file_path):
     except: pass
     return float('inf')
 
-def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=1, sa_seed=None, route_merge=True, routing_method="greedy", alns_iterations=0, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, route_merge=True, routing_method="greedy", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
     instance = InstanceCVRPTWUI(file_path)
     
     instance.Name = os.path.splitext(os.path.basename(file_path))[0]
@@ -153,14 +153,14 @@ def main():
     parser.add_argument(
         "--sa-runs",
         type=int,
-        default=1,
+        default=3,
         help="Number of simulated annealing starts to run before keeping the best schedule.",
     )
     parser.add_argument(
         "--sa-seed",
         type=int,
-        default=None,
-        help="Optional base random seed for reproducible simulated annealing multi-start runs.",
+        default=42,
+        help="Base random seed for reproducible simulated annealing multi-start runs.",
     )
     parser.add_argument(
         "--no-route-merge",
@@ -169,14 +169,23 @@ def main():
     )
     parser.add_argument(
         "--routing-method",
-        choices=("greedy", "insertion", "regret", "greedy_repair", "insertion_repair", "regret_repair"),
+        choices=(
+            "greedy",
+            "insertion",
+            "regret",
+            "seeded_regret",
+            "greedy_repair",
+            "insertion_repair",
+            "regret_repair",
+            "seeded_regret_repair",
+        ),
         default="greedy",
         help="Daily route construction method for simulated annealing.",
     )
     parser.add_argument(
         "--alns-iterations",
         type=int,
-        default=0,
+        default=30,
         help="Run this many ALNS destroy/repair iterations after each simulated annealing run.",
     )
     parser.add_argument(
@@ -225,6 +234,17 @@ def main():
         results_root = reference_results_root
         update_best = True
         benchmark_csv = os.path.join(project_root, "experiments", f"run_{timestamp}_benchmark_summary.csv")
+        print(f"Production mode: updating best outputs under {results_root}")
+
+    print(
+        "SA settings: "
+        f"runs={args.sa_runs}, seed={args.sa_seed}, "
+        f"routing={args.routing_method}, "
+        f"route_merge={not args.no_route_merge}, "
+        f"alns_iterations={args.alns_iterations}, "
+        f"alns_repair={args.alns_repair}, "
+        f"visuals={not args.no_visuals}"
+    )
 
     print(f"Found {len(all_instances)} datasets to process.")
 

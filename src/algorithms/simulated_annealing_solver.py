@@ -26,7 +26,16 @@ def get_context(instance):
 
 def set_routing_method(method):
     global ROUTING_METHOD, ROUTE_DAY_CACHE
-    if method not in ("greedy", "insertion", "regret", "greedy_repair", "insertion_repair", "regret_repair"):
+    if method not in (
+        "greedy",
+        "insertion",
+        "regret",
+        "seeded_regret",
+        "greedy_repair",
+        "insertion_repair",
+        "regret_repair",
+        "seeded_regret_repair",
+    ):
         raise ValueError(f"Unknown routing method: {method}")
     ROUTING_METHOD = method
     ROUTE_DAY_CACHE = {}
@@ -767,7 +776,9 @@ def clone_trips(trips):
     return [clone_trip(trip) for trip in trips]
 
 def route_day_uncached(instance, tasks, method):
-    if method in ("regret", "regret_repair"):
+    if method in ("seeded_regret", "seeded_regret_repair"):
+        trips = route_day_seeded_parallel_regret(instance, tasks)
+    elif method in ("regret", "regret_repair"):
         trips = route_day_regret(instance, tasks)
     elif method in ("insertion", "insertion_repair"):
         trips = route_day_insertion(instance, tasks)
@@ -907,6 +918,218 @@ def best_regret_options_for_task(instance, route_task_lists, route_stats, task, 
 
     options.sort(key=lambda option: option[0])
     return options
+
+def seeded_route_count_cap(instance, tasks):
+    if not tasks:
+        return 0
+
+    total_task_size = sum(
+        task["req"].toolCount * get_context(instance).tool_sizes[task["req"].tool - 1]
+        for task in tasks
+    )
+    capacity_floor = max(1, math.ceil(total_task_size / max(1, instance.Capacity)))
+    distance_floor = max(
+        1,
+        math.ceil(
+            sum(
+                instance.calcDistance[instance.DepotCoordinate][task["req"].node] * 2
+                for task in tasks
+            ) / max(1, instance.MaxDistance * 1.25)
+        ),
+    )
+    return min(len(tasks), max(capacity_floor, distance_floor, 2))
+
+def seeded_regret_seed_score(instance, task):
+    req = task["req"]
+    depot = instance.DepotCoordinate
+    return (
+        instance.calcDistance[depot][req.node] * instance.DistanceCost,
+        req.toolCount * instance.Tools[req.tool - 1].cost,
+        -(req.toDay - req.fromDay),
+        1 if task["type"] == "delivery" else 0,
+    )
+
+def route_task_relatedness(instance, task_a, task_b):
+    req_a = task_a["req"]
+    req_b = task_b["req"]
+    same_tool_bonus = 0
+    if req_a.tool == req_b.tool and task_a["type"] != task_b["type"]:
+        same_tool_bonus = instance.Tools[req_a.tool - 1].cost * min(req_a.toolCount, req_b.toolCount)
+    return (
+        instance.calcDistance[req_a.node][req_b.node] * instance.DistanceCost
+        - 0.10 * same_tool_bonus
+    )
+
+def choose_seeded_regret_seeds(instance, tasks, seed_count):
+    ordered = sorted(tasks, key=lambda task: seeded_regret_seed_score(instance, task), reverse=True)
+    seeds = []
+
+    for task in ordered:
+        if len(seeds) >= seed_count:
+            break
+        if any(task_cache_key([task]) == task_cache_key([seed]) for seed in seeds):
+            continue
+        if not seeds:
+            seeds.append(task)
+            continue
+
+        min_relatedness = min(route_task_relatedness(instance, task, seed) for seed in seeds)
+        if min_relatedness > 0:
+            seeds.append(task)
+
+    for task in ordered:
+        if len(seeds) >= seed_count:
+            break
+        if task not in seeds:
+            seeds.append(task)
+
+    return seeds
+
+def route_seed_synergy(instance, task, route_tasks):
+    if not route_tasks:
+        return 0
+
+    req = task["req"]
+    best_same_tool_reuse = 0
+    best_nearby = None
+    for route_task in route_tasks:
+        other = route_task["req"]
+        distance = instance.calcDistance[req.node][other.node]
+        best_nearby = distance if best_nearby is None else min(best_nearby, distance)
+        if req.tool == other.tool and task["type"] != route_task["type"]:
+            best_same_tool_reuse = max(
+                best_same_tool_reuse,
+                min(req.toolCount, other.toolCount) * instance.Tools[req.tool - 1].cost,
+            )
+
+    nearby_bonus = 0
+    if best_nearby is not None:
+        depot_distance = max(1, instance.calcDistance[instance.DepotCoordinate][req.node])
+        nearby_bonus = max(0, depot_distance - best_nearby) * instance.DistanceCost
+
+    return 0.08 * best_same_tool_reuse + 0.02 * nearby_bonus
+
+def best_seeded_regret_options_for_task(instance, route_task_lists, route_stats, task, evaluator):
+    options = []
+
+    single_trip = evaluator.trip([task])
+    if single_trip is not None:
+        score = evaluator.insertion_option_score(
+            None,
+            0,
+            single_trip,
+            [task],
+            creates_route=True,
+        )
+        options.append((score, "new", None, None, [task], single_trip))
+
+    for route_idx, route_tasks in enumerate(route_task_lists):
+        old_trip, old_bonus = route_stats[route_idx]
+        if old_trip is None:
+            continue
+        synergy = route_seed_synergy(instance, task, route_tasks)
+        for pos in range(len(route_tasks) + 1):
+            distance_delta = insertion_distance_delta(instance, route_tasks, task, pos)
+            if old_trip["distance"] + distance_delta > instance.MaxDistance:
+                continue
+            candidate_tasks = route_tasks[:pos] + [task] + route_tasks[pos:]
+            candidate_trip = evaluator.trip(candidate_tasks)
+            if candidate_trip is None:
+                continue
+
+            score = (
+                evaluator.insertion_option_score(
+                    old_trip,
+                    old_bonus,
+                    candidate_trip,
+                    candidate_tasks,
+                    creates_route=False,
+                )
+                - synergy
+            )
+            options.append((score, "insert", route_idx, pos, candidate_tasks, candidate_trip))
+
+    options.sort(key=lambda option: option[0])
+    return options
+
+def route_day_seeded_parallel_regret(instance, tasks, regret_k=3):
+    if not tasks:
+        return []
+
+    evaluator = DailyRouteEvaluator(instance)
+    seed_count = seeded_route_count_cap(instance, tasks)
+    seeds = choose_seeded_regret_seeds(instance, tasks, seed_count)
+    route_task_lists = []
+    unrouted = list(tasks)
+
+    for seed in seeds:
+        seed_trip = evaluator.trip([seed])
+        if seed_trip is None:
+            continue
+        route_task_lists.append([seed])
+        if seed in unrouted:
+            unrouted.remove(seed)
+
+    if not route_task_lists and unrouted:
+        seed = max(unrouted, key=lambda task: seeded_regret_seed_score(instance, task))
+        route_task_lists.append([seed])
+        unrouted.remove(seed)
+
+    while unrouted:
+        route_stats = [
+            (evaluator.trip(route_tasks), evaluator.reuse_bonus(route_tasks))
+            for route_tasks in route_task_lists
+        ]
+        best_choice = None
+        best_priority = None
+
+        for task in unrouted:
+            options = best_seeded_regret_options_for_task(
+                instance,
+                route_task_lists,
+                route_stats,
+                task,
+                evaluator,
+            )
+            if not options:
+                continue
+
+            best_score = options[0][0]
+            comparison_idx = min(regret_k - 1, len(options) - 1)
+            regret = options[comparison_idx][0] - best_score
+            if len(options) == 1:
+                regret += instance.VehicleDayCost + 0.05 * instance.VehicleCost
+
+            priority = (
+                regret,
+                -best_score,
+                task["req"].toolCount * instance.Tools[task["req"].tool - 1].cost,
+                instance.calcDistance[instance.DepotCoordinate][task["req"].node],
+            )
+            if best_priority is None or priority > best_priority:
+                best_priority = priority
+                best_choice = (task, options[0])
+
+        if best_choice is None:
+            task = unrouted.pop(0)
+            route_task_lists.append([task])
+            continue
+
+        task, option = best_choice
+        _, move_type, route_idx, pos, candidate_tasks, _ = option
+        unrouted.remove(task)
+        if move_type == "new":
+            route_task_lists.append(candidate_tasks)
+        else:
+            route_task_lists[route_idx] = candidate_tasks
+
+    trips = [
+        trip
+        for route_tasks in route_task_lists
+        for trip in [evaluator.trip(route_tasks)]
+        if trip is not None
+    ]
+    return trips
 
 def route_day_regret(instance, tasks, regret_k=2):
     if not tasks:
@@ -1094,6 +1317,8 @@ def route_day_portfolio_candidates(instance, tasks):
         methods.append("insertion")
     if len(tasks) <= 28:
         methods.append("regret")
+    if len(tasks) <= 34:
+        methods.append("seeded_regret")
 
     for method in methods:
         trips = route_day_with_method(instance, tasks, method)
