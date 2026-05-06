@@ -16,7 +16,10 @@ def run_validator(instance_name, solution_path):
         print(result.stdout)
         if result.stderr:
             print("ERRORS:", result.stderr)
-        if "is a valid CVRPTWUI solution" in result.stdout:
+        if (
+            "is a valid CVRPTWUI solution" in result.stdout
+            and "The given solution information is correct" in result.stdout
+        ):
             return True
         return False
         
