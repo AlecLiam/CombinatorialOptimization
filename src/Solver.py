@@ -2,6 +2,8 @@ import argparse
 import os
 import glob
 import shutil
+import time
+import csv
 from datetime import datetime
 from InstanceCVRPTWUI import InstanceCVRPTWUI
 from algorithms.baseline_solver import solve_baseline
@@ -73,6 +75,8 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
         
         best_algo_cost = get_existing_cost(final_sol_path)
         
+        start_time = time.time()
+        
         if algo_name == "Simulated Annealing":
             schedule = solver_func(
                 instance,
@@ -87,6 +91,9 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             )
         else:
             schedule = solver_func(instance)
+            
+        runtime = time.time() - start_time
+            
         new_cost = write_solution(instance, schedule, file_path=temp_sol_path, solution_name=f"{instance.Name}_{algo_name}")
         is_valid = run_validator(instance.Name, temp_sol_path)
         
@@ -113,6 +120,7 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             reference_summary = parse_solution_summary(reference_opt_path)
             candidate_summary = parse_solution_summary(candidate_path)
             row = compare_summaries(instance.Name, algo_name, reference_summary, candidate_summary, True)
+            row["runtime_seconds"] = runtime
             benchmark_rows.append(row)
             print_comparison(row)
             
@@ -129,7 +137,18 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             print(f"   [FAILED] The {algo_name} generated an invalid solution.")
             reference_summary = parse_solution_summary(reference_opt_path)
             candidate_summary = {"path": temp_sol_path, "exists": False}
-            benchmark_rows.append(compare_summaries(instance.Name, algo_name, reference_summary, candidate_summary, False))
+            row = compare_summaries(instance.Name, algo_name, reference_summary, candidate_summary, False)
+            row["runtime_seconds"] = runtime
+            benchmark_rows.append(row)
+
+    if benchmark_rows:
+        csv_path = os.path.join(instance_results_dir, f"{instance.Name}_runtime_results.csv")
+        fieldnames = list(benchmark_rows[0].keys())
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(benchmark_rows)
+        print(f"   [INFO] Instance results with runtime saved to: {csv_path}")
 
     return benchmark_rows
 
@@ -223,6 +242,9 @@ def main():
                 all_instances.append(os.path.join(data_dir, path))
     else:
         all_instances = glob.glob(os.path.join(data_dir, "*.txt"))
+
+    # RESTRICT TO B3 ONLY
+    all_instances = [f for f in all_instances if "B3.txt" in os.path.basename(f)]
 
     if args.experiment:
         results_root = os.path.join(project_root, "experiments", args.experiment, "results")
