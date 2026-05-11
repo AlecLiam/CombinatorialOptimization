@@ -231,7 +231,9 @@ def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, ".."))
     data_dir = os.path.join(project_root, "data")
-    reference_results_root = os.path.join(project_root, "results")
+    
+    # CHANGED: Output to "results new" instead of "results"
+    reference_results_root = os.path.join(project_root, "results new")
 
     if args.instances:
         all_instances = []
@@ -243,11 +245,24 @@ def main():
     else:
         all_instances = glob.glob(os.path.join(data_dir, "*.txt"))
 
-    # RESTRICT TO B3 ONLY
-    all_instances = [f for f in all_instances if "B3.txt" in os.path.basename(f)]
+    # CHANGED: Restrict to ONLY the highlighted instances from your image
+    highlighted_files = {
+        "B1.txt",
+        "B2.txt",
+        "B3.txt",
+        "challenge_r300d20_1.txt",
+        "challenge_r300d20_2.txt",
+        "challenge_r300d20_3.txt",
+        "challenge_r300d20_4.txt",
+        "challenge_r300d20_5.txt",
+        "challenge_r500d25_1.txt",
+        "challenge_r500d25_2.txt",
+        "challenge_r500d25_3.txt",
+    }
+    all_instances = [f for f in all_instances if os.path.basename(f) in highlighted_files]
 
     if args.experiment:
-        results_root = os.path.join(project_root, "experiments", args.experiment, "results")
+        results_root = os.path.join(project_root, "experiments", args.experiment, "results new")
         update_best = False
         benchmark_csv = os.path.join(project_root, "experiments", args.experiment, "benchmark_summary.csv")
         print(f"Experiment mode: writing isolated outputs to {results_root}")
