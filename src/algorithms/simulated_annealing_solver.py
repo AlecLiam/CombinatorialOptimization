@@ -2859,59 +2859,63 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
         return best_trips, best_state
     return best_trips
 
-def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method=DEFAULT_ROUTING_METHOD, alns_iterations=0, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def solve_sa(
+    instance,
+    runs=1,
+    seed=None,
+    seed_count=1,
+    route_merge=True,
+    routing_method=DEFAULT_ROUTING_METHOD,
+    alns_iterations=0,
+    alns_destroy_fraction=0.06,
+    alns_strategy="auto",
+    alns_repair="auto",
+):
     set_routing_method(routing_method)
     runs = max(1, int(runs))
-    if seed is not None:
-        random.seed(seed)
-    initial_state = generate_initial_solution(instance)
-
-    if runs == 1:
-        if seed is not None:
-            random.seed(seed)
-        schedule, state = solve_sa_single(instance, return_state=True, initial_state=initial_state)
-        if alns_iterations:
-            schedule, state = run_alns(
-                instance,
-                state,
-                initial_trips=schedule,
-                iterations=alns_iterations,
-                destroy_fraction=alns_destroy_fraction,
-                strategy=alns_strategy,
-                repair_method=alns_repair,
-            )
-        if route_merge:
-            schedule = merge_routes_postprocess(instance, schedule)
-        return schedule
+    seed_count = max(1, int(seed_count))
 
     best_schedule = None
     best_cost = float('inf')
 
+    if seed_count > 1:
+        print(f"      [SA] Seed portfolio enabled: {seed_count} seed batch(es)")
     print(f"      [SA] Multi-start enabled: {runs} runs")
-    for run_idx in range(runs):
+
+    for seed_idx in range(seed_count):
+        seed_base = None
         if seed is not None:
-            random.seed(seed + run_idx)
+            seed_base = seed + 1000 * seed_idx
+            random.seed(seed_base)
+        initial_state = generate_initial_solution(instance)
 
-        print(f"      [SA] Run {run_idx + 1}/{runs}")
-        schedule, state = solve_sa_single(instance, return_state=True, initial_state=initial_state)
-        if alns_iterations:
-            schedule, state = run_alns(
-                instance,
-                state,
-                initial_trips=schedule,
-                iterations=alns_iterations,
-                destroy_fraction=alns_destroy_fraction,
-                strategy=alns_strategy,
-                repair_method=alns_repair,
-            )
-        if route_merge:
-            schedule = merge_routes_postprocess(instance, schedule)
-        cost = evaluate_cost(instance, schedule)
+        if seed_count > 1:
+            print(f"      [SA] Seed batch {seed_idx + 1}/{seed_count}")
 
-        if cost < best_cost:
-            best_cost = cost
-            best_schedule = schedule
-            print(f"      [SA] New multi-start best: {best_cost:,.0f}")
+        for run_idx in range(runs):
+            if seed_base is not None:
+                random.seed(seed_base + run_idx)
+
+            print(f"      [SA] Run {run_idx + 1}/{runs}")
+            schedule, state = solve_sa_single(instance, return_state=True, initial_state=initial_state)
+            if alns_iterations:
+                schedule, state = run_alns(
+                    instance,
+                    state,
+                    initial_trips=schedule,
+                    iterations=alns_iterations,
+                    destroy_fraction=alns_destroy_fraction,
+                    strategy=alns_strategy,
+                    repair_method=alns_repair,
+                )
+            if route_merge:
+                schedule = merge_routes_postprocess(instance, schedule)
+            cost = evaluate_cost(instance, schedule)
+
+            if cost < best_cost:
+                best_cost = cost
+                best_schedule = schedule
+                print(f"      [SA] New multi-start best: {best_cost:,.0f}")
 
     print(f"      [SA] Multi-start complete. Best Estimated Cost: {best_cost:,.0f}")
     return best_schedule

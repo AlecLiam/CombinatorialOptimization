@@ -32,7 +32,7 @@ def get_existing_cost(file_path):
     except: pass
     return float('inf')
 
-def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, route_merge=True, routing_method="savings", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, sa_seed_count=1, route_merge=True, routing_method="savings", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
     instance_start_time = perf_counter()
     instance = InstanceCVRPTWUI(file_path)
     
@@ -81,6 +81,7 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
                 instance,
                 runs=sa_runs,
                 seed=sa_seed,
+                seed_count=sa_seed_count,
                 route_merge=route_merge,
                 routing_method=routing_method,
                 alns_iterations=alns_iterations,
@@ -168,6 +169,12 @@ def main():
         help="Base random seed for reproducible simulated annealing multi-start runs.",
     )
     parser.add_argument(
+        "--sa-seed-count",
+        type=int,
+        default=1,
+        help="Number of deterministic seed batches to try before keeping the best SA schedule.",
+    )
+    parser.add_argument(
         "--no-route-merge",
         action="store_true",
         help="Disable simulated annealing route merge post-processing.",
@@ -245,7 +252,7 @@ def main():
 
     print(
         "SA settings: "
-        f"runs={args.sa_runs}, seed={args.sa_seed}, "
+        f"runs={args.sa_runs}, seed={args.sa_seed}, seed_count={args.sa_seed_count}, "
         f"routing={args.routing_method}, "
         f"route_merge={not args.no_route_merge}, "
         f"alns_iterations={args.alns_iterations}, "
@@ -265,6 +272,7 @@ def main():
             make_visuals=not args.no_visuals,
             sa_runs=args.sa_runs,
             sa_seed=args.sa_seed,
+            sa_seed_count=args.sa_seed_count,
             route_merge=not args.no_route_merge,
             routing_method=args.routing_method,
             alns_iterations=args.alns_iterations,
