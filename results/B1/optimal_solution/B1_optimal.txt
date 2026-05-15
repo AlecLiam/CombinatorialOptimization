@@ -1,5 +1,5 @@
 DATASET = co2020 case challenge part
-NAME = B1_Simulated Annealing
+NAME = B1
 
 MAX_NUMBER_OF_VEHICLES = 5
 NUMBER_OF_VEHICLE_DAYS = 53

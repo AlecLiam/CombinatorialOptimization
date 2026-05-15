@@ -1,5 +1,5 @@
 DATASET = ORTEC-hidden instance set VeRoLog competition
-NAME = B2_Simulated Annealing
+NAME = B2
 
 MAX_NUMBER_OF_VEHICLES = 17
 NUMBER_OF_VEHICLE_DAYS = 205
