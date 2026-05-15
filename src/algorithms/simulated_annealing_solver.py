@@ -2,8 +2,31 @@ import random
 import math
 from algorithms.baseline_solver import solve_baseline
 
-ROUTING_METHOD = "greedy"
+DEFAULT_ROUTING_METHOD = "savings"
+ROUTING_METHOD = DEFAULT_ROUTING_METHOD
 ROUTE_DAY_CACHE = {}
+
+# Runtime guardrails for the daily routing portfolio. They are empirical
+# cutoffs, not theoretical constants: heavier insertion/regret methods are
+# only tried on days small enough for repeated rerouting during SA/repair.
+INSERTION_TASK_LIMIT = 36
+REGRET_TASK_LIMIT = 28
+SEEDED_REGRET_TASK_LIMIT = 34
+REPAIR_TASK_LIMIT = 32
+EXACT_TOOL_REPAIR_LIMIT = 12
+
+ROUTING_METHODS = (
+    "greedy",
+    "insertion",
+    "regret",
+    "seeded_regret",
+    "savings",
+    "greedy_repair",
+    "insertion_repair",
+    "regret_repair",
+    "seeded_regret_repair",
+    "savings_repair",
+)
 
 class SolverContext:
     def __init__(self, instance):
@@ -26,16 +49,7 @@ def get_context(instance):
 
 def set_routing_method(method):
     global ROUTING_METHOD, ROUTE_DAY_CACHE
-    if method not in (
-        "greedy",
-        "insertion",
-        "regret",
-        "seeded_regret",
-        "greedy_repair",
-        "insertion_repair",
-        "regret_repair",
-        "seeded_regret_repair",
-    ):
+    if method not in ROUTING_METHODS:
         raise ValueError(f"Unknown routing method: {method}")
     ROUTING_METHOD = method
     ROUTE_DAY_CACHE = {}
@@ -775,9 +789,138 @@ def clone_trip(trip):
 def clone_trips(trips):
     return [clone_trip(trip) for trip in trips]
 
+def route_day_savings(instance, tasks):
+    if not tasks:
+        return []
+
+    evaluator = DailyRouteEvaluator(instance)
+
+    def key(task):
+        return (task["req"].ID, task["type"])
+
+    active_routes = []
+    route_by_task = {}
+    fallback_tasks = []
+
+    for task in tasks:
+        if evaluator.trip([task]) is None:
+            fallback_tasks.append(task)
+            continue
+        route_idx = len(active_routes)
+        active_routes.append([task])
+        route_by_task[key(task)] = route_idx
+
+    if not active_routes:
+        return route_day_greedy(instance, tasks)
+
+    depot = instance.DepotCoordinate
+    savings = []
+    for left_idx, left_task in enumerate(tasks):
+        left_key = key(left_task)
+        if left_key not in route_by_task:
+            continue
+        left_node = left_task["req"].node
+        for right_task in tasks[left_idx + 1:]:
+            right_key = key(right_task)
+            if right_key not in route_by_task:
+                continue
+            right_node = right_task["req"].node
+            distance_saving = (
+                instance.calcDistance[depot][left_node]
+                + instance.calcDistance[depot][right_node]
+                - instance.calcDistance[left_node][right_node]
+            ) * instance.DistanceCost
+            reuse_bonus = 0
+            if (
+                left_task["req"].tool == right_task["req"].tool
+                and left_task["type"] != right_task["type"]
+            ):
+                tool_idx = left_task["req"].tool - 1
+                reuse_bonus = (
+                    min(left_task["req"].toolCount, right_task["req"].toolCount)
+                    * instance.Tools[tool_idx].cost
+                )
+            savings.append((distance_saving + 0.02 * reuse_bonus, left_key, right_key))
+
+    savings.sort(reverse=True)
+
+    for _, left_key, right_key in savings:
+        left_route_idx = route_by_task.get(left_key)
+        right_route_idx = route_by_task.get(right_key)
+        if left_route_idx is None or right_route_idx is None or left_route_idx == right_route_idx:
+            continue
+
+        left_route = active_routes[left_route_idx]
+        right_route = active_routes[right_route_idx]
+        if left_route is None or right_route is None:
+            continue
+
+        left_first = key(left_route[0])
+        left_last = key(left_route[-1])
+        right_first = key(right_route[0])
+        right_last = key(right_route[-1])
+
+        merge_candidates = []
+        if left_last == left_key and right_first == right_key:
+            merge_candidates.append(left_route + right_route)
+        if left_first == left_key and right_last == right_key:
+            merge_candidates.append(right_route + left_route)
+        if left_first == left_key and right_first == right_key:
+            merge_candidates.append(list(reversed(left_route)) + right_route)
+        if left_last == left_key and right_last == right_key:
+            merge_candidates.append(left_route + list(reversed(right_route)))
+
+        if not merge_candidates:
+            continue
+
+        left_trip = evaluator.trip(left_route)
+        right_trip = evaluator.trip(right_route)
+        if left_trip is None or right_trip is None:
+            continue
+
+        old_score = (
+            evaluator.local_score(left_trip)
+            + evaluator.local_score(right_trip)
+            + instance.VehicleDayCost
+        )
+        best_candidate = None
+        best_score = None
+
+        for candidate_tasks in merge_candidates:
+            candidate_trip = evaluator.trip(candidate_tasks)
+            if candidate_trip is None:
+                continue
+            candidate_score = evaluator.local_score(candidate_trip)
+            if best_score is None or candidate_score < best_score:
+                best_score = candidate_score
+                best_candidate = candidate_tasks
+
+        if best_candidate is None or best_score > old_score:
+            continue
+
+        active_routes[left_route_idx] = best_candidate
+        active_routes[right_route_idx] = None
+        for task in best_candidate:
+            route_by_task[key(task)] = left_route_idx
+
+    trips = [
+        trip
+        for route_tasks in active_routes
+        if route_tasks is not None
+        for trip in [evaluator.trip(route_tasks)]
+        if trip is not None
+    ]
+
+    if fallback_tasks:
+        trips.extend(route_day_greedy(instance, fallback_tasks))
+
+    return trips
+
 def route_day_uncached(instance, tasks, method):
     if method in ("seeded_regret", "seeded_regret_repair"):
         trips = route_day_seeded_parallel_regret(instance, tasks)
+    elif method in ("savings", "savings_repair"):
+        trips = route_day_savings(instance, tasks)
     elif method in ("regret", "regret_repair"):
         trips = route_day_regret(instance, tasks)
     elif method in ("insertion", "insertion_repair"):
@@ -864,21 +1007,6 @@ def route_day_insertion(instance, tasks):
         for trip in [evaluator.trip(route_tasks)]
         if trip is not None
     ]
-
-def route_reuse_bonus(instance, route_tasks):
-    return DailyRouteEvaluator(instance).reuse_bonus(route_tasks)
-
-def trip_tool_load_cost(instance, trip):
-    return DailyRouteEvaluator(instance).tool_load_cost(trip)
-
-def insertion_option_score(instance, old_trip, old_bonus, candidate_trip, candidate_tasks, creates_route):
-    return DailyRouteEvaluator(instance).insertion_option_score(
-        old_trip,
-        old_bonus,
-        candidate_trip,
-        candidate_tasks,
-        creates_route,
-    )
 
 def best_regret_options_for_task(instance, route_task_lists, route_stats, task, evaluator):
     options = []
@@ -1200,9 +1328,6 @@ def route_day_regret(instance, tasks, regret_k=2):
         if trip is not None
     ]
 
-def trip_local_score(instance, trip):
-    return DailyRouteEvaluator(instance).local_score(trip)
-
 def improve_trip_sequence(instance, trip, max_passes=2, evaluator=None):
     evaluator = evaluator or DailyRouteEvaluator(instance)
     tasks = evaluator.route_tasks(trip)
@@ -1305,29 +1430,31 @@ def route_day(instance, tasks):
 def route_signature(trips):
     return tuple(tuple(trip["route"]) for trip in trips)
 
-def route_day_portfolio_candidates(instance, tasks):
+def route_portfolio_methods(task_count):
+    methods = ["greedy", "savings"]
+    if task_count <= INSERTION_TASK_LIMIT:
+        methods.append("insertion")
+    if task_count <= REGRET_TASK_LIMIT:
+        methods.append("regret")
+    if task_count <= SEEDED_REGRET_TASK_LIMIT:
+        methods.append("seeded_regret")
+    return methods
+
+def route_day_portfolio_candidates(instance, tasks, include_repair=True):
     if not tasks:
         return [[]]
 
     candidates = []
     seen = set()
 
-    methods = ["greedy"]
-    if len(tasks) <= 36:
-        methods.append("insertion")
-    if len(tasks) <= 28:
-        methods.append("regret")
-    if len(tasks) <= 34:
-        methods.append("seeded_regret")
-
-    for method in methods:
+    for method in route_portfolio_methods(len(tasks)):
         trips = route_day_with_method(instance, tasks, method)
         signature = route_signature(trips)
         if signature not in seen:
             candidates.append(trips)
             seen.add(signature)
 
-        if len(tasks) <= 32:
+        if include_repair and len(tasks) <= REPAIR_TASK_LIMIT:
             repaired = route_day_with_method(instance, tasks, f"{method}_repair")
             signature = route_signature(repaired)
             if signature not in seen:
@@ -1372,18 +1499,6 @@ def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, af
         improved_schedule[day] = best_trips_for_day
 
     return improved_schedule
-
-def route_distance(instance, tasks):
-    if not tasks:
-        return 0
-    depot = instance.DepotCoordinate
-    total_dist = 0
-    curr_node = depot
-    for task in tasks:
-        total_dist += instance.calcDistance[curr_node][task["req"].node]
-        curr_node = task["req"].node
-    total_dist += instance.calcDistance[curr_node][depot]
-    return total_dist
 
 def greedy_insert_tasks(instance, base_tasks, inserted_tasks, evaluator=None):
     evaluator = evaluator or DailyRouteEvaluator(instance)
@@ -2468,7 +2583,7 @@ def repair_destroyed_requests(
         dominant_part == "tools"
         and current_trips is not None
         and current_components is not None
-        and len(removed_requests) <= 12
+        and len(removed_requests) <= EXACT_TOOL_REPAIR_LIMIT
     ):
         exact_state = repair_destroyed_requests_exact_regret(
             instance,
@@ -2744,9 +2859,11 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
         return best_trips, best_state
     return best_trips
 
-def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method="greedy", alns_iterations=0, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method=DEFAULT_ROUTING_METHOD, alns_iterations=0, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
     set_routing_method(routing_method)
     runs = max(1, int(runs))
+    if seed is not None:
+        random.seed(seed)
     initial_state = generate_initial_solution(instance)
 
     if runs == 1:
@@ -2768,7 +2885,6 @@ def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method="gree
         return schedule
 
     best_schedule = None
-    best_state = None
     best_cost = float('inf')
 
     print(f"      [SA] Multi-start enabled: {runs} runs")
@@ -2795,7 +2911,6 @@ def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method="gree
         if cost < best_cost:
             best_cost = cost
             best_schedule = schedule
-            best_state = state
             print(f"      [SA] New multi-start best: {best_cost:,.0f}")
 
     print(f"      [SA] Multi-start complete. Best Estimated Cost: {best_cost:,.0f}")

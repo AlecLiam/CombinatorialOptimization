@@ -3,6 +3,7 @@ import os
 import glob
 import shutil
 from datetime import datetime
+from time import perf_counter
 from InstanceCVRPTWUI import InstanceCVRPTWUI
 from algorithms.baseline_solver import solve_baseline
 from algorithms.simulated_annealing_solver import solve_sa
@@ -31,7 +32,8 @@ def get_existing_cost(file_path):
     except: pass
     return float('inf')
 
-def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, route_merge=True, routing_method="greedy", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, route_merge=True, routing_method="savings", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+    instance_start_time = perf_counter()
     instance = InstanceCVRPTWUI(file_path)
     
     instance.Name = os.path.splitext(os.path.basename(file_path))[0]
@@ -52,6 +54,7 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
 
     if not instance.isValid():
         print("Parser found errors. Skipping...")
+        print(f"Instance runtime: {perf_counter() - instance_start_time:.2f} seconds")
         return []
 
     if make_visuals:
@@ -87,7 +90,7 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             )
         else:
             schedule = solver_func(instance)
-        new_cost = write_solution(instance, schedule, file_path=temp_sol_path, solution_name=f"{instance.Name}_{algo_name}")
+        new_cost = write_solution(instance, schedule, file_path=temp_sol_path)
         is_valid = run_validator(instance.Name, temp_sol_path)
         
         if is_valid:
@@ -131,9 +134,11 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             candidate_summary = {"path": temp_sol_path, "exists": False}
             benchmark_rows.append(compare_summaries(instance.Name, algo_name, reference_summary, candidate_summary, False))
 
+    print(f"Instance runtime: {perf_counter() - instance_start_time:.2f} seconds")
     return benchmark_rows
 
 def main():
+    total_start_time = perf_counter()
     parser = argparse.ArgumentParser(description="Run CO case solvers and optionally benchmark experiments.")
     parser.add_argument(
         "instances",
@@ -174,12 +179,14 @@ def main():
             "insertion",
             "regret",
             "seeded_regret",
+            "savings",
             "greedy_repair",
             "insertion_repair",
             "regret_repair",
             "seeded_regret_repair",
+            "savings_repair",
         ),
-        default="greedy",
+        default="savings",
         help="Daily route construction method for simulated annealing.",
     )
     parser.add_argument(
@@ -270,6 +277,7 @@ def main():
     write_benchmark_csv(all_rows, benchmark_csv)
     if all_rows:
         print(f"\nBenchmark summary written to: {benchmark_csv}")
+    print(f"Total runtime: {perf_counter() - total_start_time:.2f} seconds")
             
 if __name__ == "__main__":
     main()
