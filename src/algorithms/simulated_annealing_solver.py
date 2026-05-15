@@ -2,8 +2,29 @@ import random
 import math
 from algorithms.baseline_solver import solve_baseline
 
-ROUTING_METHOD = "greedy"
+DEFAULT_ROUTING_METHOD = "savings"
+ROUTING_METHOD = DEFAULT_ROUTING_METHOD
 ROUTE_DAY_CACHE = {}
+
+# Limits for daily route constructors used during repeated rerouting.
+INSERTION_TASK_LIMIT = 36
+REGRET_TASK_LIMIT = 28
+SEEDED_REGRET_TASK_LIMIT = 34
+REPAIR_TASK_LIMIT = 32
+EXACT_TOOL_REPAIR_LIMIT = 12
+
+ROUTING_METHODS = (
+    "greedy",
+    "insertion",
+    "regret",
+    "seeded_regret",
+    "savings",
+    "greedy_repair",
+    "insertion_repair",
+    "regret_repair",
+    "seeded_regret_repair",
+    "savings_repair",
+)
 
 class SolverContext:
     def __init__(self, instance):
@@ -26,16 +47,7 @@ def get_context(instance):
 
 def set_routing_method(method):
     global ROUTING_METHOD, ROUTE_DAY_CACHE
-    if method not in (
-        "greedy",
-        "insertion",
-        "regret",
-        "seeded_regret",
-        "greedy_repair",
-        "insertion_repair",
-        "regret_repair",
-        "seeded_regret_repair",
-    ):
+    if method not in ROUTING_METHODS:
         raise ValueError(f"Unknown routing method: {method}")
     ROUTING_METHOD = method
     ROUTE_DAY_CACHE = {}
@@ -387,7 +399,7 @@ def build_trips_from_state(instance, start_days):
         day for day, trips in trips_by_day.items()
         if trips
     ]
-    trips_by_day = improve_affected_days_by_portfolio(
+    trips_by_day = improve_affected_days(
         instance,
         trips_by_day,
         start_days,
@@ -431,7 +443,7 @@ def patch_trips_from_state(instance, current_trips, old_state, new_state):
         tasks = tasks_by_day.get(day, [])
         patched_trips[day] = route_day(instance, tasks)
 
-    patched_trips = improve_affected_days_by_portfolio(
+    patched_trips = improve_affected_days(
         instance,
         patched_trips,
         new_state,
@@ -578,24 +590,23 @@ def build_trip_from_route(instance, route):
     requests_by_id = ctx.requests_by_id
     num_tools = ctx.num_tools
     depot = ctx.depot
-
-    def node_coordinate(node):
-        if node == 0:
-            return depot
-        return requests_by_id[abs(node)].node
+    distances = instance.calcDistance
 
     total_dist = 0
-    for prev_node, next_node in zip(route, route[1:]):
-        if prev_node == 0 and next_node == 0:
+    previous_coord = depot
+    previous_node = route[0]
+    for next_node in route[1:]:
+        if previous_node == 0 and next_node == 0:
             return None
-        from_coord = node_coordinate(prev_node)
-        to_coord = node_coordinate(next_node)
-        total_dist += instance.calcDistance[from_coord][to_coord]
-
-    if total_dist > instance.MaxDistance:
-        return None
+        next_coord = depot if next_node == 0 else requests_by_id[abs(next_node)].node
+        total_dist += distances[previous_coord][next_coord]
+        previous_node = next_node
+        previous_coord = next_coord
+        if total_dist > instance.MaxDistance:
+            return None
 
     tool_size = ctx.tool_sizes
+    capacity = instance.Capacity
     current_tools = [0] * num_tools
     segment_states = []
     visit_loads = [[0] * num_tools]
@@ -606,24 +617,34 @@ def build_trip_from_route(instance, route):
                 return None
             bring_tools = [0] * num_tools
             for state in segment_states:
-                bring_tools = [min(a, b) for a, b in zip(bring_tools, state)]
-                bring_tools = [min(0, value) for value in bring_tools]
+                for idx in range(num_tools):
+                    if state[idx] < bring_tools[idx]:
+                        bring_tools[idx] = state[idx]
+                    if bring_tools[idx] > 0:
+                        bring_tools[idx] = 0
 
-            visit_loads[-1] = [a + b for a, b in zip(visit_loads[-1], bring_tools)]
+            current_visit_load = visit_loads[-1]
+            for idx in range(num_tools):
+                current_visit_load[idx] += bring_tools[idx]
 
-            loaded = sum(size * -amount for size, amount in zip(tool_size, visit_loads[-1]))
-            if loaded > instance.Capacity:
+            loaded = 0
+            for idx in range(num_tools):
+                loaded += tool_size[idx] * -current_visit_load[idx]
+            if loaded > capacity:
                 return None
 
             for state in segment_states:
-                loaded = sum(
-                    size * (state_amount - depot_amount)
-                    for size, state_amount, depot_amount in zip(tool_size, state, visit_loads[-1])
-                )
-                if loaded > instance.Capacity:
+                loaded = 0
+                for idx in range(num_tools):
+                    loaded += tool_size[idx] * (state[idx] - current_visit_load[idx])
+                if loaded > capacity:
                     return None
 
-            visit_loads.append([b - a for a, b in zip(bring_tools, segment_states[-1])])
+            last_state = segment_states[-1]
+            visit_loads.append([
+                last_state[idx] - bring_tools[idx]
+                for idx in range(num_tools)
+            ])
             current_tools = [0] * num_tools
             segment_states = []
         else:
@@ -638,12 +659,11 @@ def build_trip_from_route(instance, route):
     visit_total = [0] * num_tools
     total_used_at_start = [0] * num_tools
     for visit in visit_loads:
-        visit_total = [a + b for a, b in zip(visit_total, visit)]
-        total_used_at_start = [
-            used - min(0, current)
-            for current, used in zip(visit_total, total_used_at_start)
-        ]
-        visit_total = [max(0, current) for current in visit_total]
+        for idx in range(num_tools):
+            visit_total[idx] += visit[idx]
+            if visit_total[idx] < 0:
+                total_used_at_start[idx] -= visit_total[idx]
+                visit_total[idx] = 0
 
     return {
         "route": route,
@@ -682,6 +702,9 @@ def task_cache_key(tasks):
         (task["req"].ID, task["type"])
         for task in tasks
     )
+
+def trip_signature(trip):
+    return tuple(trip["route"])
 
 class DailyRouteEvaluator:
     def __init__(self, instance):
@@ -761,6 +784,9 @@ class DailyRouteEvaluator:
             0.35 * tool_load_delta
         )
 
+def clone_optional_trip(trip):
+    return clone_trip(trip) if trip is not None else None
+
 def clone_trip(trip):
     cloned = {
         "route": list(trip["route"]),
@@ -775,9 +801,138 @@ def clone_trip(trip):
 def clone_trips(trips):
     return [clone_trip(trip) for trip in trips]
 
+def route_day_savings(instance, tasks):
+    if not tasks:
+        return []
+
+    evaluator = DailyRouteEvaluator(instance)
+
+    def key(task):
+        return (task["req"].ID, task["type"])
+
+    active_routes = []
+    route_by_task = {}
+    fallback_tasks = []
+
+    for task in tasks:
+        if evaluator.trip([task]) is None:
+            fallback_tasks.append(task)
+            continue
+        route_idx = len(active_routes)
+        active_routes.append([task])
+        route_by_task[key(task)] = route_idx
+
+    if not active_routes:
+        return route_day_greedy(instance, tasks)
+
+    depot = instance.DepotCoordinate
+    savings = []
+    for left_idx, left_task in enumerate(tasks):
+        left_key = key(left_task)
+        if left_key not in route_by_task:
+            continue
+        left_node = left_task["req"].node
+        for right_task in tasks[left_idx + 1:]:
+            right_key = key(right_task)
+            if right_key not in route_by_task:
+                continue
+            right_node = right_task["req"].node
+            distance_saving = (
+                instance.calcDistance[depot][left_node]
+                + instance.calcDistance[depot][right_node]
+                - instance.calcDistance[left_node][right_node]
+            ) * instance.DistanceCost
+            reuse_bonus = 0
+            if (
+                left_task["req"].tool == right_task["req"].tool
+                and left_task["type"] != right_task["type"]
+            ):
+                tool_idx = left_task["req"].tool - 1
+                reuse_bonus = (
+                    min(left_task["req"].toolCount, right_task["req"].toolCount)
+                    * instance.Tools[tool_idx].cost
+                )
+            savings.append((distance_saving + 0.02 * reuse_bonus, left_key, right_key))
+
+    savings.sort(reverse=True)
+
+    for _, left_key, right_key in savings:
+        left_route_idx = route_by_task.get(left_key)
+        right_route_idx = route_by_task.get(right_key)
+        if left_route_idx is None or right_route_idx is None or left_route_idx == right_route_idx:
+            continue
+
+        left_route = active_routes[left_route_idx]
+        right_route = active_routes[right_route_idx]
+        if left_route is None or right_route is None:
+            continue
+
+        left_first = key(left_route[0])
+        left_last = key(left_route[-1])
+        right_first = key(right_route[0])
+        right_last = key(right_route[-1])
+
+        merge_candidates = []
+        if left_last == left_key and right_first == right_key:
+            merge_candidates.append(left_route + right_route)
+        if left_first == left_key and right_last == right_key:
+            merge_candidates.append(right_route + left_route)
+        if left_first == left_key and right_first == right_key:
+            merge_candidates.append(list(reversed(left_route)) + right_route)
+        if left_last == left_key and right_last == right_key:
+            merge_candidates.append(left_route + list(reversed(right_route)))
+
+        if not merge_candidates:
+            continue
+
+        left_trip = evaluator.trip(left_route)
+        right_trip = evaluator.trip(right_route)
+        if left_trip is None or right_trip is None:
+            continue
+
+        old_score = (
+            evaluator.local_score(left_trip)
+            + evaluator.local_score(right_trip)
+            + instance.VehicleDayCost
+        )
+        best_candidate = None
+        best_score = None
+
+        for candidate_tasks in merge_candidates:
+            candidate_trip = evaluator.trip(candidate_tasks)
+            if candidate_trip is None:
+                continue
+            candidate_score = evaluator.local_score(candidate_trip)
+            if best_score is None or candidate_score < best_score:
+                best_score = candidate_score
+                best_candidate = candidate_tasks
+
+        if best_candidate is None or best_score > old_score:
+            continue
+
+        active_routes[left_route_idx] = best_candidate
+        active_routes[right_route_idx] = None
+        for task in best_candidate:
+            route_by_task[key(task)] = left_route_idx
+
+    trips = [
+        trip
+        for route_tasks in active_routes
+        if route_tasks is not None
+        for trip in [evaluator.trip(route_tasks)]
+        if trip is not None
+    ]
+
+    if fallback_tasks:
+        trips.extend(route_day_greedy(instance, fallback_tasks))
+
+    return trips
+
 def route_day_uncached(instance, tasks, method):
     if method in ("seeded_regret", "seeded_regret_repair"):
         trips = route_day_seeded_parallel_regret(instance, tasks)
+    elif method in ("savings", "savings_repair"):
+        trips = route_day_savings(instance, tasks)
     elif method in ("regret", "regret_repair"):
         trips = route_day_regret(instance, tasks)
     elif method in ("insertion", "insertion_repair"):
@@ -864,21 +1019,6 @@ def route_day_insertion(instance, tasks):
         for trip in [evaluator.trip(route_tasks)]
         if trip is not None
     ]
-
-def route_reuse_bonus(instance, route_tasks):
-    return DailyRouteEvaluator(instance).reuse_bonus(route_tasks)
-
-def trip_tool_load_cost(instance, trip):
-    return DailyRouteEvaluator(instance).tool_load_cost(trip)
-
-def insertion_option_score(instance, old_trip, old_bonus, candidate_trip, candidate_tasks, creates_route):
-    return DailyRouteEvaluator(instance).insertion_option_score(
-        old_trip,
-        old_bonus,
-        candidate_trip,
-        candidate_tasks,
-        creates_route,
-    )
 
 def best_regret_options_for_task(instance, route_task_lists, route_stats, task, evaluator):
     options = []
@@ -1200,9 +1340,6 @@ def route_day_regret(instance, tasks, regret_k=2):
         if trip is not None
     ]
 
-def trip_local_score(instance, trip):
-    return DailyRouteEvaluator(instance).local_score(trip)
-
 def improve_trip_sequence(instance, trip, max_passes=2, evaluator=None):
     evaluator = evaluator or DailyRouteEvaluator(instance)
     tasks = evaluator.route_tasks(trip)
@@ -1305,29 +1442,31 @@ def route_day(instance, tasks):
 def route_signature(trips):
     return tuple(tuple(trip["route"]) for trip in trips)
 
-def route_day_portfolio_candidates(instance, tasks):
+def route_candidate_methods(task_count):
+    methods = ["greedy", "savings"]
+    if task_count <= INSERTION_TASK_LIMIT:
+        methods.append("insertion")
+    if task_count <= REGRET_TASK_LIMIT:
+        methods.append("regret")
+    if task_count <= SEEDED_REGRET_TASK_LIMIT:
+        methods.append("seeded_regret")
+    return methods
+
+def route_day_candidates(instance, tasks, include_repair=True):
     if not tasks:
         return [[]]
 
     candidates = []
     seen = set()
 
-    methods = ["greedy"]
-    if len(tasks) <= 36:
-        methods.append("insertion")
-    if len(tasks) <= 28:
-        methods.append("regret")
-    if len(tasks) <= 34:
-        methods.append("seeded_regret")
-
-    for method in methods:
+    for method in route_candidate_methods(len(tasks)):
         trips = route_day_with_method(instance, tasks, method)
         signature = route_signature(trips)
         if signature not in seen:
             candidates.append(trips)
             seen.add(signature)
 
-        if len(tasks) <= 32:
+        if include_repair and len(tasks) <= REPAIR_TASK_LIMIT:
             repaired = route_day_with_method(instance, tasks, f"{method}_repair")
             signature = route_signature(repaired)
             if signature not in seen:
@@ -1336,7 +1475,7 @@ def route_day_portfolio_candidates(instance, tasks):
 
     return candidates
 
-def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, affected_days):
+def improve_affected_days(instance, schedule_by_day, start_days, affected_days):
     improved_schedule = {
         day: list(trips)
         for day, trips in schedule_by_day.items()
@@ -1351,7 +1490,7 @@ def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, af
         best_trips_for_day = improved_schedule.get(day, [])
         best_cost = best_components["total"]
 
-        for candidate_trips in route_day_portfolio_candidates(instance, tasks):
+        for candidate_trips in route_day_candidates(instance, tasks):
             if route_signature(candidate_trips) == route_signature(best_trips_for_day):
                 continue
             candidate_schedule = improved_schedule.copy()
@@ -1373,18 +1512,6 @@ def improve_affected_days_by_portfolio(instance, schedule_by_day, start_days, af
 
     return improved_schedule
 
-def route_distance(instance, tasks):
-    if not tasks:
-        return 0
-    depot = instance.DepotCoordinate
-    total_dist = 0
-    curr_node = depot
-    for task in tasks:
-        total_dist += instance.calcDistance[curr_node][task["req"].node]
-        curr_node = task["req"].node
-    total_dist += instance.calcDistance[curr_node][depot]
-    return total_dist
-
 def greedy_insert_tasks(instance, base_tasks, inserted_tasks, evaluator=None):
     evaluator = evaluator or DailyRouteEvaluator(instance)
     merged = base_tasks.copy()
@@ -1404,7 +1531,18 @@ def greedy_insert_tasks(instance, base_tasks, inserted_tasks, evaluator=None):
         merged = best_sequence
     return evaluator.trip(merged)
 
-def try_merge_trips(instance, trip_a, trip_b, evaluator=None):
+def try_merge_trips(instance, trip_a, trip_b, evaluator=None, merge_cache=None):
+    signature_a = trip_signature(trip_a)
+    signature_b = trip_signature(trip_b)
+    cache_key = (
+        signature_a,
+        signature_b,
+    )
+    if signature_b < signature_a:
+        cache_key = (signature_b, signature_a)
+    if merge_cache is not None and cache_key in merge_cache:
+        return clone_optional_trip(merge_cache[cache_key])
+
     evaluator = evaluator or DailyRouteEvaluator(instance)
     tasks_a = evaluator.route_tasks(trip_a)
     tasks_b = evaluator.route_tasks(trip_b)
@@ -1435,8 +1573,13 @@ def try_merge_trips(instance, trip_a, trip_b, evaluator=None):
             candidates.append(trip)
 
     if not candidates:
+        if merge_cache is not None:
+            merge_cache[cache_key] = None
         return None
-    return min(candidates, key=lambda trip: trip["distance"])
+    best_trip = min(candidates, key=lambda trip: trip["distance"])
+    if merge_cache is not None:
+        merge_cache[cache_key] = clone_trip(best_trip)
+    return best_trip
 
 def merge_routes_postprocess(instance, schedule_by_day):
     improved_schedule = {
@@ -1446,6 +1589,7 @@ def merge_routes_postprocess(instance, schedule_by_day):
     current_components = evaluate_cost_components(instance, improved_schedule)
     current_cost = current_components["total"]
     merges_applied = 0
+    merge_cache = {}
 
     improved = True
     while improved:
@@ -1458,7 +1602,12 @@ def merge_routes_postprocess(instance, schedule_by_day):
                 continue
             for i in range(len(trips)):
                 for j in range(i + 1, len(trips)):
-                    merged_trip = try_merge_trips(instance, trips[i], trips[j])
+                    merged_trip = try_merge_trips(
+                        instance,
+                        trips[i],
+                        trips[j],
+                        merge_cache=merge_cache,
+                    )
                     if merged_trip is None:
                         continue
 
@@ -1728,13 +1877,52 @@ def calculate_partial_daily_tool_usage(instance, partial_state):
             daily_usage[day][req.tool - 1] += req.toolCount
     return daily_usage
 
-def is_partial_schedule_feasible(instance, partial_state):
-    daily_usage = calculate_partial_daily_tool_usage(instance, partial_state)
+def partial_state_key(partial_state):
+    return tuple(sorted(partial_state.items()))
+
+def calculate_partial_state_stats(instance, partial_state):
+    ctx = get_context(instance)
+    num_tools = ctx.num_tools
+    daily_usage = {day: [0] * num_tools for day in range(1, instance.Days + 2)}
+    task_counts_by_day = {day: 0 for day in range(1, instance.Days + 2)}
+    distance_roundtrip_proxy = 0
+    depot = instance.DepotCoordinate
+    distances = instance.calcDistance
+
+    for req in ctx.requests:
+        if req.ID not in partial_state:
+            continue
+        start_day = partial_state[req.ID]
+        pickup_day = start_day + req.numDays
+        for day in active_tool_days(instance, req, start_day):
+            daily_usage[day][req.tool - 1] += req.toolCount
+        if start_day <= instance.Days:
+            task_counts_by_day[start_day] += 1
+        if pickup_day <= instance.Days:
+            task_counts_by_day[pickup_day] += 1
+        distance_roundtrip_proxy += 2 * distances[depot][req.node]
+
+    return daily_usage, task_counts_by_day, distance_roundtrip_proxy
+
+def get_partial_state_stats(instance, partial_state, stats_cache=None):
+    if stats_cache is None:
+        return calculate_partial_state_stats(instance, partial_state)
+    key = partial_state_key(partial_state)
+    if key not in stats_cache:
+        stats_cache[key] = calculate_partial_state_stats(instance, partial_state)
+    return stats_cache[key]
+
+def partial_usage_within_tool_limits(instance, daily_usage):
     for usage in daily_usage.values():
         for tool_idx, amount in enumerate(usage):
             if amount > instance.Tools[tool_idx].amount:
                 return False
     return True
+
+def is_partial_schedule_feasible(instance, partial_state, daily_usage=None):
+    if daily_usage is None:
+        daily_usage = calculate_partial_daily_tool_usage(instance, partial_state)
+    return partial_usage_within_tool_limits(instance, daily_usage)
 
 def get_partial_tasks_for_day(instance, partial_state, day):
     tasks = []
@@ -2174,26 +2362,19 @@ def score_completed_schedule(instance, schedule, dominant_part, reference_compon
     components = evaluate_cost_components(instance, schedule)
     return score_components(instance, components, dominant_part, reference_components)
 
-def partial_repair_score(instance, partial_state, dominant_part, exact_days=None):
-    daily_usage = calculate_partial_daily_tool_usage(instance, partial_state)
+def partial_repair_score(instance, partial_state, dominant_part, exact_days=None, precomputed_stats=None):
+    if precomputed_stats is None:
+        daily_usage, task_counts_by_day, distance_roundtrip_proxy = calculate_partial_state_stats(
+            instance,
+            partial_state,
+        )
+    else:
+        daily_usage, task_counts_by_day, distance_roundtrip_proxy = precomputed_stats
     tool_use = [
         max(usage[tool_idx] for usage in daily_usage.values())
         for tool_idx in range(len(instance.Tools))
     ]
     tool_cost = weighted_tool_use_cost(instance, tool_use)
-
-    task_counts_by_day = {day: 0 for day in range(1, instance.Days + 2)}
-    distance_roundtrip_proxy = 0
-    for req in instance.Requests:
-        if req.ID not in partial_state:
-            continue
-        start_day = partial_state[req.ID]
-        pickup_day = start_day + req.numDays
-        if start_day <= instance.Days:
-            task_counts_by_day[start_day] += 1
-        if pickup_day <= instance.Days:
-            task_counts_by_day[pickup_day] += 1
-        distance_roundtrip_proxy += 2 * instance.calcDistance[instance.DepotCoordinate][req.node]
 
     task_day_proxy = sum(task_counts_by_day.values())
     max_task_day_proxy = max(task_counts_by_day.values(), default=0)
@@ -2265,7 +2446,7 @@ def partial_repair_score(instance, partial_state, dominant_part, exact_days=None
         return distance_proxy + 0.1 * vehicle_day_proxy + 0.05 * tool_cost
     return vehicle_day_proxy + 0.2 * fixed_vehicle_proxy + 0.05 * tool_cost
 
-def best_request_insertions(instance, repaired_state, req, dominant_part):
+def best_request_insertions(instance, repaired_state, req, dominant_part, stats_cache=None):
     options = []
     days = list(range(req.fromDay, req.toDay + 1))
     random.shuffle(days)
@@ -2273,10 +2454,17 @@ def best_request_insertions(instance, repaired_state, req, dominant_part):
     for candidate_day in days:
         candidate_state = repaired_state.copy()
         candidate_state[req.ID] = candidate_day
-        if not is_partial_schedule_feasible(instance, candidate_state):
+        stats = get_partial_state_stats(instance, candidate_state, stats_cache)
+        if not partial_usage_within_tool_limits(instance, stats[0]):
             continue
         exact_days = {candidate_day, candidate_day + req.numDays}
-        score = partial_repair_score(instance, candidate_state, dominant_part, exact_days=exact_days)
+        score = partial_repair_score(
+            instance,
+            candidate_state,
+            dominant_part,
+            exact_days=exact_days,
+            precomputed_stats=stats,
+        )
         options.append((score, candidate_day))
 
     options.sort(key=lambda item: item[0])
@@ -2333,6 +2521,7 @@ def repair_destroyed_requests_greedy(instance, current_state, removed_requests, 
         partial_state.pop(req.ID, None)
 
     repaired_state = partial_state.copy()
+    stats_cache = {}
     ordered_requests = sorted(
         removed_requests,
         key=lambda req: (req.toDay - req.fromDay, -req.toolCount * instance.Tools[req.tool - 1].cost),
@@ -2347,11 +2536,18 @@ def repair_destroyed_requests_greedy(instance, current_state, removed_requests, 
         for candidate_day in days:
             candidate_state = repaired_state.copy()
             candidate_state[req.ID] = candidate_day
-            if not is_partial_schedule_feasible(instance, candidate_state):
+            stats = get_partial_state_stats(instance, candidate_state, stats_cache)
+            if not partial_usage_within_tool_limits(instance, stats[0]):
                 continue
 
             exact_days = {candidate_day, candidate_day + req.numDays}
-            score = partial_repair_score(instance, candidate_state, dominant_part, exact_days=exact_days)
+            score = partial_repair_score(
+                instance,
+                candidate_state,
+                dominant_part,
+                exact_days=exact_days,
+                precomputed_stats=stats,
+            )
             if best_score is None or score < best_score:
                 best_score = score
                 best_day = candidate_day
@@ -2367,13 +2563,20 @@ def repair_destroyed_requests_regret(instance, current_state, removed_requests, 
     uninserted = list(removed_requests)
     for req in uninserted:
         repaired_state.pop(req.ID, None)
+    stats_cache = {}
 
     while uninserted:
         best_choice = None
         best_regret = None
 
         for req in uninserted:
-            options = best_request_insertions(instance, repaired_state, req, dominant_part)
+            options = best_request_insertions(
+                instance,
+                repaired_state,
+                req,
+                dominant_part,
+                stats_cache=stats_cache,
+            )
             if not options:
                 return None
 
@@ -2468,7 +2671,7 @@ def repair_destroyed_requests(
         dominant_part == "tools"
         and current_trips is not None
         and current_components is not None
-        and len(removed_requests) <= 12
+        and len(removed_requests) <= EXACT_TOOL_REPAIR_LIMIT
     ):
         exact_state = repair_destroyed_requests_exact_regret(
             instance,
@@ -2744,59 +2947,63 @@ def solve_sa_single(instance, return_state=False, initial_state=None):
         return best_trips, best_state
     return best_trips
 
-def solve_sa(instance, runs=1, seed=None, route_merge=True, routing_method="greedy", alns_iterations=0, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def solve_sa(
+    instance,
+    runs=1,
+    seed=None,
+    seed_count=3,
+    route_merge=True,
+    routing_method=DEFAULT_ROUTING_METHOD,
+    alns_iterations=0,
+    alns_destroy_fraction=0.06,
+    alns_strategy="auto",
+    alns_repair="auto",
+):
     set_routing_method(routing_method)
     runs = max(1, int(runs))
-    initial_state = generate_initial_solution(instance)
-
-    if runs == 1:
-        if seed is not None:
-            random.seed(seed)
-        schedule, state = solve_sa_single(instance, return_state=True, initial_state=initial_state)
-        if alns_iterations:
-            schedule, state = run_alns(
-                instance,
-                state,
-                initial_trips=schedule,
-                iterations=alns_iterations,
-                destroy_fraction=alns_destroy_fraction,
-                strategy=alns_strategy,
-                repair_method=alns_repair,
-            )
-        if route_merge:
-            schedule = merge_routes_postprocess(instance, schedule)
-        return schedule
+    seed_count = max(1, int(seed_count))
 
     best_schedule = None
-    best_state = None
     best_cost = float('inf')
 
+    if seed_count > 1:
+        print(f"      [SA] Seed search enabled: {seed_count} group(s)")
     print(f"      [SA] Multi-start enabled: {runs} runs")
-    for run_idx in range(runs):
+
+    for seed_idx in range(seed_count):
+        seed_base = None
         if seed is not None:
-            random.seed(seed + run_idx)
+            seed_base = seed + 1000 * seed_idx
+            random.seed(seed_base)
+        initial_state = generate_initial_solution(instance)
 
-        print(f"      [SA] Run {run_idx + 1}/{runs}")
-        schedule, state = solve_sa_single(instance, return_state=True, initial_state=initial_state)
-        if alns_iterations:
-            schedule, state = run_alns(
-                instance,
-                state,
-                initial_trips=schedule,
-                iterations=alns_iterations,
-                destroy_fraction=alns_destroy_fraction,
-                strategy=alns_strategy,
-                repair_method=alns_repair,
-            )
-        if route_merge:
-            schedule = merge_routes_postprocess(instance, schedule)
-        cost = evaluate_cost(instance, schedule)
+        if seed_count > 1:
+            print(f"      [SA] Seed group {seed_idx + 1}/{seed_count}")
 
-        if cost < best_cost:
-            best_cost = cost
-            best_schedule = schedule
-            best_state = state
-            print(f"      [SA] New multi-start best: {best_cost:,.0f}")
+        for run_idx in range(runs):
+            if seed_base is not None:
+                random.seed(seed_base + run_idx)
+
+            print(f"      [SA] Run {run_idx + 1}/{runs}")
+            schedule, state = solve_sa_single(instance, return_state=True, initial_state=initial_state)
+            if alns_iterations:
+                schedule, state = run_alns(
+                    instance,
+                    state,
+                    initial_trips=schedule,
+                    iterations=alns_iterations,
+                    destroy_fraction=alns_destroy_fraction,
+                    strategy=alns_strategy,
+                    repair_method=alns_repair,
+                )
+            if route_merge:
+                schedule = merge_routes_postprocess(instance, schedule)
+            cost = evaluate_cost(instance, schedule)
+
+            if cost < best_cost:
+                best_cost = cost
+                best_schedule = schedule
+                print(f"      [SA] New multi-start best: {best_cost:,.0f}")
 
     print(f"      [SA] Multi-start complete. Best Estimated Cost: {best_cost:,.0f}")
     return best_schedule

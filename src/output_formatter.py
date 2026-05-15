@@ -1,18 +1,3 @@
-import os
-
-def active_tool_days(instance, req, start_day):
-    last_active_day = min(start_day + req.numDays, instance.Days)
-    return range(start_day, last_active_day + 1)
-
-def extract_start_days_from_schedule(instance, schedule_by_day):
-    start_days = {}
-    for day, trips in schedule_by_day.items():
-        for trip in trips:
-            for node_id in trip["route"][1:-1]:
-                if node_id > 0 and node_id not in start_days:
-                    start_days[node_id] = day
-    return start_days
-
 def calculate_tool_use(instance, schedule_by_day):
     # Keep this aligned with validator/Validate.py so written COST and TOOL_USE
     # are accepted as the official submitted solution information.
@@ -34,7 +19,7 @@ def calculate_tool_use(instance, schedule_by_day):
 
     return [abs(x) for x in min_inventory]
 
-def write_solution(instance, schedule_by_day, file_path, solution_name="solution"):
+def write_solution(instance, schedule_by_day, file_path):
     num_tools = len(instance.Tools)
     tool_use = calculate_tool_use(instance, schedule_by_day)
 
@@ -53,7 +38,7 @@ def write_solution(instance, schedule_by_day, file_path, solution_name="solution
         
     with open(file_path, 'w') as f:
         f.write(f"DATASET = {instance.Dataset}\n")
-        f.write(f"NAME = {solution_name}\n\n")
+        f.write(f"NAME = {instance.Name}\n\n")
         f.write(f"MAX_NUMBER_OF_VEHICLES = {max_vehicles}\n")
         f.write(f"NUMBER_OF_VEHICLE_DAYS = {vehicle_days}\n")
         f.write(f"TOOL_USE = {' '.join(str(x) for x in tool_use)}\n")

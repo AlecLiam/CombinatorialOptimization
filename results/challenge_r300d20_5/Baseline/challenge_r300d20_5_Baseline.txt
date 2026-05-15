@@ -1,5 +1,5 @@
 DATASET = co2020 case challenge part
-NAME = challenge_r300d20_5_Baseline
+NAME = challenge_r300d20_5
 
 MAX_NUMBER_OF_VEHICLES = 40
 NUMBER_OF_VEHICLE_DAYS = 600

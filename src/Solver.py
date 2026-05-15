@@ -2,7 +2,7 @@ import argparse
 import os
 import glob
 import shutil
-from datetime import datetime
+from time import perf_counter
 from InstanceCVRPTWUI import InstanceCVRPTWUI
 from algorithms.baseline_solver import solve_baseline
 from algorithms.simulated_annealing_solver import solve_sa
@@ -20,18 +20,8 @@ ALGORITHMS = {
     "Simulated Annealing": solve_sa
 }
 
-def get_existing_cost(file_path):
-    if not os.path.exists(file_path): 
-        return float('inf')
-    try:
-        with open(file_path, 'r') as f:
-            for line in f:
-                if line.startswith("COST ="):
-                    return float(line.split("=")[1].strip())
-    except: pass
-    return float('inf')
-
-def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, route_merge=True, routing_method="greedy", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+def process_instance(file_path, results_root, reference_results_root, update_best=True, make_visuals=True, sa_runs=3, sa_seed=42, sa_seed_count=3, route_merge=True, routing_method="savings", alns_iterations=30, alns_destroy_fraction=0.06, alns_strategy="auto", alns_repair="auto"):
+    instance_start_time = perf_counter()
     instance = InstanceCVRPTWUI(file_path)
     
     instance.Name = os.path.splitext(os.path.basename(file_path))[0]
@@ -52,6 +42,7 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
 
     if not instance.isValid():
         print("Parser found errors. Skipping...")
+        print(f"Instance runtime: {perf_counter() - instance_start_time:.2f} seconds")
         return []
 
     if make_visuals:
@@ -61,6 +52,7 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
         plot_network(instance, network_path)
 
     benchmark_rows = []
+    best_current_solution = None
     for algo_name, solver_func in ALGORITHMS.items():
         print(f"\n-> Running Algorithm: [{algo_name}]")
         
@@ -70,14 +62,13 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
         final_sol_path = os.path.join(algo_dir, f"{instance.Name}_{algo_name}.txt")
         temp_sol_path = os.path.join(algo_dir, f"temp_{instance.Name}.txt")
         gif_path = os.path.join(algo_dir, f"{instance.Name}_{algo_name}_active_routes.gif")
-        
-        best_algo_cost = get_existing_cost(final_sol_path)
-        
+
         if algo_name == "Simulated Annealing":
             schedule = solver_func(
                 instance,
                 runs=sa_runs,
                 seed=sa_seed,
+                seed_count=sa_seed_count,
                 route_merge=route_merge,
                 routing_method=routing_method,
                 alns_iterations=alns_iterations,
@@ -87,27 +78,23 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             )
         else:
             schedule = solver_func(instance)
-        new_cost = write_solution(instance, schedule, file_path=temp_sol_path, solution_name=f"{instance.Name}_{algo_name}")
+        new_cost = write_solution(instance, schedule, file_path=temp_sol_path)
         is_valid = run_validator(instance.Name, temp_sol_path)
         
         if is_valid:
-            if new_cost < best_algo_cost:
-                if update_best:
-                    print(f"   [SUCCESS] Found new best for {algo_name}! Cost: {new_cost:,.0f}")
-                else:
-                    print(f"   [RECORDED] Experiment solution cost: {new_cost:,.0f}")
-                os.replace(temp_sol_path, final_sol_path)
-                if make_visuals:
-                    from visualizer import animate_routes_to_gif
+            os.replace(temp_sol_path, final_sol_path)
+            print(f"   [RECORDED] Valid {algo_name} solution cost: {new_cost:,.0f}")
+            if make_visuals:
+                from visualizer import animate_routes_to_gif
 
-                    animate_routes_to_gif(instance, schedule, gif_path)
-            else:
-                if update_best:
-                    os.remove(temp_sol_path)
-                    print(f"   [SKIPPED] Cost {new_cost:,.0f} did not beat {algo_name} best of {best_algo_cost:,.0f}.")
-                else:
-                    os.replace(temp_sol_path, final_sol_path)
-                    print(f"   [RECORDED] Experiment solution cost: {new_cost:,.0f}")
+                animate_routes_to_gif(instance, schedule, gif_path)
+
+            if best_current_solution is None or new_cost < best_current_solution["cost"]:
+                best_current_solution = {
+                    "cost": new_cost,
+                    "solution_path": final_sol_path,
+                    "gif_path": gif_path,
+                }
 
             candidate_path = final_sol_path if os.path.exists(final_sol_path) else temp_sol_path
             reference_summary = parse_solution_summary(reference_opt_path)
@@ -115,15 +102,6 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             row = compare_summaries(instance.Name, algo_name, reference_summary, candidate_summary, True)
             benchmark_rows.append(row)
             print_comparison(row)
-            
-            if update_best:
-                global_opt_path = os.path.join(optimal_dir, f"{instance.Name}_optimal.txt")
-                best_global_cost = get_existing_cost(global_opt_path)
-                
-                if new_cost < best_global_cost or not os.path.exists(global_opt_path):
-                    print(f"   NEW GLOBAL OPTIMAL FOUND! Cost: {new_cost:,.0f}")
-                    if os.path.exists(final_sol_path): shutil.copy(final_sol_path, global_opt_path)
-                    if os.path.exists(gif_path): shutil.copy(gif_path, os.path.join(optimal_dir, f"{instance.Name}_optimal_active_routes.gif"))
         else:
             os.remove(temp_sol_path)
             print(f"   [FAILED] The {algo_name} generated an invalid solution.")
@@ -131,9 +109,21 @@ def process_instance(file_path, results_root, reference_results_root, update_bes
             candidate_summary = {"path": temp_sol_path, "exists": False}
             benchmark_rows.append(compare_summaries(instance.Name, algo_name, reference_summary, candidate_summary, False))
 
+    if update_best and best_current_solution is not None:
+        global_opt_path = os.path.join(optimal_dir, f"{instance.Name}_optimal.txt")
+        shutil.copy(best_current_solution["solution_path"], global_opt_path)
+        if make_visuals and os.path.exists(best_current_solution["gif_path"]):
+            shutil.copy(
+                best_current_solution["gif_path"],
+                os.path.join(optimal_dir, f"{instance.Name}_optimal_active_routes.gif"),
+            )
+        print(f"   Current-run optimal recorded: {best_current_solution['cost']:,.0f}")
+
+    print(f"Instance runtime: {perf_counter() - instance_start_time:.2f} seconds")
     return benchmark_rows
 
 def main():
+    total_start_time = perf_counter()
     parser = argparse.ArgumentParser(description="Run CO case solvers and optionally benchmark experiments.")
     parser.add_argument(
         "instances",
@@ -163,6 +153,12 @@ def main():
         help="Base random seed for reproducible simulated annealing multi-start runs.",
     )
     parser.add_argument(
+        "--sa-seed-count",
+        type=int,
+        default=3,
+        help="Number of deterministic seed groups to try before keeping the best SA schedule.",
+    )
+    parser.add_argument(
         "--no-route-merge",
         action="store_true",
         help="Disable simulated annealing route merge post-processing.",
@@ -174,12 +170,14 @@ def main():
             "insertion",
             "regret",
             "seeded_regret",
+            "savings",
             "greedy_repair",
             "insertion_repair",
             "regret_repair",
             "seeded_regret_repair",
+            "savings_repair",
         ),
-        default="greedy",
+        default="savings",
         help="Daily route construction method for simulated annealing.",
     )
     parser.add_argument(
@@ -230,15 +228,14 @@ def main():
         benchmark_csv = os.path.join(project_root, "experiments", args.experiment, "benchmark_summary.csv")
         print(f"Experiment mode: writing isolated outputs to {results_root}")
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_root = reference_results_root
         update_best = True
-        benchmark_csv = os.path.join(project_root, "experiments", f"run_{timestamp}_benchmark_summary.csv")
-        print(f"Production mode: updating best outputs under {results_root}")
+        benchmark_csv = os.path.join(results_root, "benchmark_summary.csv")
+        print(f"Production mode: writing current outputs under {results_root}")
 
     print(
         "SA settings: "
-        f"runs={args.sa_runs}, seed={args.sa_seed}, "
+        f"runs={args.sa_runs}, seed={args.sa_seed}, seed_count={args.sa_seed_count}, "
         f"routing={args.routing_method}, "
         f"route_merge={not args.no_route_merge}, "
         f"alns_iterations={args.alns_iterations}, "
@@ -258,6 +255,7 @@ def main():
             make_visuals=not args.no_visuals,
             sa_runs=args.sa_runs,
             sa_seed=args.sa_seed,
+            sa_seed_count=args.sa_seed_count,
             route_merge=not args.no_route_merge,
             routing_method=args.routing_method,
             alns_iterations=args.alns_iterations,
@@ -270,6 +268,7 @@ def main():
     write_benchmark_csv(all_rows, benchmark_csv)
     if all_rows:
         print(f"\nBenchmark summary written to: {benchmark_csv}")
+    print(f"Total runtime: {perf_counter() - total_start_time:.2f} seconds")
             
 if __name__ == "__main__":
     main()
